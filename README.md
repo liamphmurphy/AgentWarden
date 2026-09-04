@@ -155,7 +155,9 @@ agentwarden --config                               # show the resolved configura
   "providers": {
     "ollama": {
       "baseUrl": "http://127.0.0.1:11434/v1",
-      "models": { "qwen3.5:latest": { "name": "qwen3.5" } }
+      // contextWindow is optional; set it to see context pressure as a
+      // percentage in the session panel.
+      "models": { "qwen3.5:latest": { "name": "qwen3.5", "contextWindow": 8192 } }
     },
     "gateway": {
       "baseUrl": "https://your-gateway.example.com/v1",
@@ -219,6 +221,43 @@ any non-terminal state → cancelled
 
 Every `(state, action)` pair not in the table is denied, so adding a state can
 never widen what is reachable by accident.
+
+### What a handoff has to prove
+
+`workflow_submit_implementation` is refused unless the work tree actually
+moved. The tree is fingerprinted when the task enters an editing stage
+(`implementing`, `changes_requested`, and again on every return to one), and a
+submission whose fingerprint still equals that baseline cannot be an
+implementation — whatever it says about itself.
+
+This is not belt-and-braces; it is the only thing standing between the
+enforcer and a fabricated handoff, because **gates cannot detect work that was
+never done**. On an unchanged tree `go test`, `go vet` and the integration
+suite all pass, so a placeholder submission sails through verification and
+arrives at review with a full set of green receipts. Four tasks in one
+repository reached `qa_review` exactly that way, one of them with a handoff
+reading *"No changes yet — this is a placeholder submission to unblock the
+state machine"*, and all three of its gates green. Passing gates prove the
+tree is healthy; only the fingerprint proves the tree changed.
+
+`files_changed` is required for the same reason, and is the cheap version of
+the check — it catches the honest case before any git call.
+
+### Who owns each stage
+
+`verifying` belongs to the runtime, not the model. There is no tool it could
+call to advance from there, so it is never given a turn: the gates run the
+moment the stage is entered, from inside the agent loop, and the workflow moves
+on to review or back to implementation without the model being consulted.
+
+That matters more than it sounds. When verification ran only *after* a run had
+finished, a model that reached `verifying` kept being sent requests offering it
+four read-only tools and no way forward — thirteen turns of it in one observed
+session — until it hit the step limit and reported a blocker that was not
+actually true. The rule now is general: **if nothing in the visible tool list
+could advance the workflow, the model is not asked.** The run ends with the
+reason instead, so a stage a policy has made unsatisfiable is reported rather
+than silently consuming the whole step budget.
 
 ### Custom states
 
@@ -355,6 +394,71 @@ discovered from `skillDirs` as either `<dir>/SKILL.md` or loose `*.md`. A skill
 an agent references but which does not exist is reported on stderr rather than
 silently dropped.
 
+## The session panel
+
+The right-hand column reports the three things a session accumulates silently:
+where the workflow is, how full the context is, and what it has spent.
+
+```
+╭ …transcript……………………………………………………………╮ ╭────────────────────────╮
+│                                    │ │ Stage                  │
+│  Let me read the failing test      │ │ ✓ planning             │
+│  first.                            │ │ ▸ implementing         │
+│                                    │ │   ↳ engineer           │
+│  ✓ read                            │ │ · verifying            │
+│                                    │ │ · qa_review            │
+│                                    │ │ · ready_to_complete    │
+│                                    │ │ · complete             │
+│                                    │ │                        │
+│                                    │ │ Context            38% │
+│                                    │ │ █████░░░░░░░           │
+│                                    │ │ 12.4k of 32k           │
+│                                    │ │                        │
+│                                    │ │ Tokens                 │
+│                                    │ │ sent             45.1k │
+│                                    │ │ recv              2.3k │
+│                                    │ │ turns                7 │
+╰────────────────────────────────────╯ ╰────────────────────────╯
+```
+
+`ctrl+t` (or `/stats`) hides it and gives the column back to the transcript,
+which is what you want when reading a wide diff. It drops itself automatically
+below 72 columns.
+
+**Stage** is the pipeline walked from the policy's own transition graph, so a
+project with custom `states:` sees its own stages rather than the builtin ones.
+Passed stages are ticked, the current one is pointed at and names the agent
+that owns it. Recovery stages are deliberately off the spine — `changes_requested`
+is reachable only by rejection, so drawing it inline would claim every task
+passes through it; when you are in one it is named underneath instead. The
+whole section disappears in plain mode, because then there is no stage to be in.
+
+**Context** is the newest turn's prompt against the model's window. It is the
+newest prompt rather than a running total on purpose: every turn resends the
+conversation, so summing prompts would report a window many times overflowed.
+The meter turns amber at 70% and red at 90%.
+
+**Tokens** are cumulative for the session: `sent` and `recv` answer "what has
+this cost", `turns` is how many model round-trips it took.
+
+Two honest gaps worth knowing about:
+
+- **`contextWindow` has to be configured.** An OpenAI-compatible endpoint
+  reports how many tokens a request *used*, never how many it would *accept*,
+  so the window cannot be discovered. Without it the panel shows the prompt
+  size and says `set contextWindow` rather than inventing a denominator.
+- **For Ollama, use the served context, not the model's maximum.** `ollama
+  show` may report a 262144-token architecture limit while the server truncates
+  at its own default (`OLLAMA_CONTEXT_LENGTH`, or `num_ctx` in a Modelfile).
+  Putting the architecture number in the config would draw a meter reading 5%
+  as the request was being silently cut.
+
+If an endpoint reports no usage at all, both counters say `not reported`
+instead of showing zeros — an unmeasured session and a free one are not the
+same thing. Usage is requested explicitly with `stream_options.include_usage`,
+since a streamed response omits it otherwise; an endpoint that rejects the
+field can drop it with `"stream_options": null` under that provider's `extra`.
+
 ## Switching between governed and plain
 
 Governance is worth it for delivery work and in the way for a quick question,
@@ -380,14 +484,51 @@ reads as an offer rather than a label. The gate-pane hint only appears when
 there are gates to show.
 
 This is a real swap of the enforcer inside the running agent loop, not a
-relabelling. After `ctrl+g` to plain the next request carries every tool and no
-`tool_choice`; after `ctrl+g` back, the tool list is masked to the current
-stage again. Confirm it with `--log-requests`:
+relabelling, and **nothing about the workflow follows the session into plain
+mode**. Four things change together, because leaving any one of them behind
+produces a session that still behaves as though a stage were under way:
+
+| | Governed | Plain |
+|---|---|---|
+| Tool list | masked to the stage | everything except `workflow_*` |
+| System prompt | the stage owner's agent | a plain assistant, stated as such |
+| Permissions | the stage owner's rules | edit and shell allowed |
+| Task and stage | tracked and reported | none; the panel drops the section |
+
+The `workflow_*` tools are withheld in plain mode for a reason beyond tidiness:
+they are not inert. They advance stored task state through the controller, so an
+ungoverned session holding them could submit a plan or complete a task with no
+gate checked — governance would be off while its state advanced. Their presence
+also misleads: a model handed `workflow_start` and `workflow_status` infers it
+is inside a workflow and narrates one.
+
+The system prompt matters just as much. A workflow role agent's instructions
+("call `workflow_start`, do not implement yourself") describe a workflow that
+is not running, and a model reads that as a governed session in progress. Plain
+mode therefore drops the role prompt and keeps the agent's *skills*, which are
+reference material rather than role instructions. An agent named explicitly
+with `-agent` is kept in both modes — that is your instruction, not the
+workflow's.
+
+Permissions follow the same logic. A stage owner's rules exist to divide the
+workflow's duties: the orchestrator may not edit because the engineer does that.
+With no workflow those divisions describe nothing, so plain mode allows edit and
+shell rather than enforcing a separation of duties that no longer exists. An
+agent you named with `-agent` keeps its own rules, deny rules included.
+
+Confirm all of it with `--log-requests`:
 
 ```
-governed, planning:  read, ls, glob, grep, workflow_submit_plan, …      (7 tools)
-plain:               read, write, edit, ls, glob, grep, bash, task, …  (15 tools)
+governed, planning:  read, ls, glob, grep, workflow_submit_plan, …     (7 tools)
+governed, implementing:  + write, edit, bash, workflow_submit_implementation
+plain:               read, write, edit, ls, glob, grep, bash, task      (8 tools)
 ```
+
+Because the switch happens mid-conversation, the earlier turns still describe
+whichever mode you left. The system message is rewritten in place — assigning
+the field alone would not do it, since the prompt is copied into the message
+list before the first turn — and a short note is appended saying the rules
+changed, because that is where a small model is actually looking.
 
 If a project has no workflow policy the mode cannot be switched on, and the bar
 says why — `○ plain (no policy)` — rather than offering a key that could only
@@ -400,6 +541,31 @@ agentwarden                        # governed if the project enables it
 agentwarden --no-workflow          # start plain; ctrl+g is still available
 agentwarden run "quick question"   # one-shot, for scripting
 ```
+
+### Managing tasks from outside a session
+
+A governed task outlives the session that created it, and two of its states —
+`blocked` and any stage a policy has made unsatisfiable — have no tool the
+model could call to leave them. Those are the operator's to resolve:
+
+```sh
+agentwarden -tasks               # every task in this project, newest first
+agentwarden -resume <task-id>    # reopen a blocked task
+agentwarden -cancel <task-id>    # take a task out of play
+```
+
+```
+e317147f7150  qa_review          2026-09-04 12:39  interactive session
+74ceaf8a4a92  planning           2026-09-04 12:16  interactive session
+```
+
+Both actions run as the orchestrator, because the person at the terminal owns
+the workflow and there is no more authoritative actor than the operator. The
+state machine still applies: cancelling an already-cancelled task is refused
+rather than quietly accepted.
+
+Cancelling matters for a task holding evidence you do not trust. A task parked
+in `qa_review` is one approval away from `complete`, and nothing expires it.
 
 `--auto` pre-approves tool calls that would otherwise prompt. It upgrades
 "ask" to "allow" but **never overrides an explicit `deny` rule** — a rule you
@@ -457,6 +623,7 @@ serves whatever has been pulled.
 | `ctrl+g` | Toggle governed / plain |
 | `ctrl+p` | Switch provider / model |
 | `ctrl+w` | Toggle the gate pane |
+| `ctrl+t` | Toggle the session panel (stage, context, tokens) |
 | `ctrl+c` | Cancel the running turn (or quit when idle) |
 | `ctrl+d` | Quit |
 
@@ -481,7 +648,7 @@ the same command twice does not mean pressing `↑` twice to get past it. Slash
 commands are recorded too — a mistyped `/modle` is exactly what you want back.
 History is per session and holds the last 200 prompts.
 
-`/help` · `/model` · `/mode` · `/govern` · `/plain` · `/auto` · `/gates` · `/clear` · `/quit`
+`/help` · `/model` · `/mode` · `/govern` · `/plain` · `/auto` · `/gates` · `/stats` · `/copy` · `/mouse` · `/clear` · `/quit`
 
 ## Verifying it actually works
 

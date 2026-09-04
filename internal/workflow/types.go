@@ -89,6 +89,12 @@ type Fingerprint struct {
 	Digest string `json:"digest"`
 }
 
+// IsEditingState reports whether a state is one where the model may change
+// the work tree, and so one whose entry needs a baseline recorded.
+func IsEditingState(s State) bool {
+	return s == StateImplementing || s == StateChangesRequested
+}
+
 // Same reports whether two fingerprints describe the same working tree. Both
 // components must match, and an empty fingerprint never equals another.
 func (f Fingerprint) Same(other Fingerprint) bool {
@@ -110,17 +116,22 @@ type QA struct {
 
 // Task is the full persisted state of one governed unit of work.
 type Task struct {
-	ID          string             `json:"id"`
-	Objective   string             `json:"objective"`
-	State       State              `json:"state"`
-	ResumeState State              `json:"resumeState,omitempty"`
-	Plan        string             `json:"plan,omitempty"`
-	Handoff     string             `json:"handoff,omitempty"`
-	PolicyHash  string             `json:"policyHash"`
-	Receipts    map[string]Receipt `json:"receipts"`
-	QA          *QA                `json:"qa,omitempty"`
-	Events      []Event            `json:"events"`
-	Revision    int                `json:"revision"`
-	CreatedAt   time.Time          `json:"createdAt"`
-	UpdatedAt   time.Time          `json:"updatedAt"`
+	ID          string `json:"id"`
+	Objective   string `json:"objective"`
+	State       State  `json:"state"`
+	ResumeState State  `json:"resumeState,omitempty"`
+	Plan        string `json:"plan,omitempty"`
+	Handoff     string `json:"handoff,omitempty"`
+	// Baseline is the work tree as it stood when the task entered an editing
+	// stage. It is what makes "I changed nothing" detectable without
+	// believing anything the model says: a submission whose fingerprint still
+	// equals the baseline cannot be an implementation.
+	Baseline   *Fingerprint       `json:"baseline,omitempty"`
+	PolicyHash string             `json:"policyHash"`
+	Receipts   map[string]Receipt `json:"receipts"`
+	QA         *QA                `json:"qa,omitempty"`
+	Events     []Event            `json:"events"`
+	Revision   int                `json:"revision"`
+	CreatedAt  time.Time          `json:"createdAt"`
+	UpdatedAt  time.Time          `json:"updatedAt"`
 }

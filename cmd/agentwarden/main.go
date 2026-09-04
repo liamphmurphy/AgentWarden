@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -44,6 +45,9 @@ type options struct {
 	logRequests string
 	objective   string
 	showConfig  bool
+	listTasks   bool
+	cancelTask  string
+	resumeTask  string
 }
 
 func main() {
@@ -68,6 +72,9 @@ Flags:
   -log-requests path  append every provider payload to a JSONL file
   -objective string  objective for a new governed task
   -config            print the resolved configuration and exit
+  -tasks             list this project's governed tasks and exit
+  -cancel id         cancel a governed task and exit
+  -resume id         resume a blocked governed task and exit
 
 Governance is on only when the config enables it and a policy file exists.
 `)
@@ -94,14 +101,20 @@ func run() error {
 	fs.StringVar(&opts.logRequests, "log-requests", "", "append provider payloads to a JSONL file")
 	fs.StringVar(&opts.objective, "objective", "", "objective for a new governed task")
 	fs.BoolVar(&opts.showConfig, "config", false, "print the resolved configuration")
+	fs.BoolVar(&opts.listTasks, "tasks", false, "list governed tasks")
+	fs.StringVar(&opts.cancelTask, "cancel", "", "cancel a governed task by id")
+	fs.StringVar(&opts.resumeTask, "resume", "", "resume a blocked governed task by id")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	prompt := strings.Join(fs.Args(), " ")
 
-	opts.inspectOnly = opts.showConfig
+	// Every one of these inspects or repairs existing state, so none of them
+	// may start a task of its own on the way in.
+	opts.inspectOnly = opts.showConfig || opts.listTasks ||
+		opts.cancelTask != "" || opts.resumeTask != ""
 
-	app, err := build(opts, oneShot)
+	app, err := build(opts)
 	if err != nil {
 		return err
 	}
@@ -109,6 +122,15 @@ func run() error {
 
 	if opts.showConfig {
 		return app.printConfig()
+	}
+	if opts.listTasks {
+		return app.printTasks()
+	}
+	if opts.cancelTask != "" {
+		return app.cancelTask(opts.cancelTask)
+	}
+	if opts.resumeTask != "" {
+		return app.resumeTask(opts.resumeTask)
 	}
 	if oneShot {
 		if prompt == "" {
@@ -139,6 +161,10 @@ type app struct {
 	actor    *controller.Actor
 	skills   *skill.Set
 	agents   *agent.Registry
+	// agentExplicit records that the user named the agent with -agent, which
+	// is honoured in plain mode too; a merely configured default is not, since
+	// defaultAgent is the identity a governed session starts from.
+	agentExplicit bool
 
 	// enforcer is the real governor, held separately from the active one so
 	// governance can be engaged and disengaged without rebuilding it.
@@ -190,9 +216,24 @@ func (a *app) SetGoverned(on bool) error {
 		a.governed = false
 		a.governor = enforce.NewNop()
 		a.loop.Governor = a.governor
-		// Without a governor there is nothing to re-target on a state change.
+
+		// Nothing about the workflow may follow the session into plain mode.
+		// The task is what the loop masks and reports against; the session
+		// carries the stage's role and its escalation counters; the prompt and
+		// the permission rules are the stage owner's. Leaving any of them
+		// behind is what makes a plain session still act as though a planning
+		// stage were under way, and refuse the edit it was just asked for.
+		a.loop.Task = nil
+		a.loop.Session = &enforce.Session{}
 		a.loop.TaskRefresh = nil
 		a.loop.OnStateChange = nil
+		a.applyPlainPermissions()
+		a.loop.SetSystemPrompt(a.systemPrompt())
+		// The conversation still contains the governed turns, so the change
+		// is stated where the model is looking rather than only in the
+		// system prompt it has already read.
+		a.loop.Note(plainSwitchNote)
+		a.announceState()
 		return nil
 	}
 	if !a.policyAvailable {
@@ -201,7 +242,7 @@ func (a *app) SetGoverned(on bool) error {
 
 	// A session that started plain has no task yet.
 	if a.task == nil {
-		task, err := a.ctl.Start("interactive session")
+		task, err := a.ctl.Start(context.Background(), "interactive session")
 		if err != nil {
 			return err
 		}
@@ -216,18 +257,105 @@ func (a *app) SetGoverned(on bool) error {
 	a.governed = true
 	a.governor = a.enforcer
 	a.loop.Governor = a.governor
-	a.loop.Task = a.task
-	a.loop.TaskRefresh = func() (*workflow.Task, error) { return a.ctl.Get(a.task.ID) }
-	a.loop.OnStateChange = func(task *workflow.Task) {
-		a.task = task
-		a.syncActor()
-		a.retargetSession(a.loop)
-		a.announceState()
-	}
+	a.attachGovernance(a.loop)
 	a.syncActor()
 	a.retargetSession(a.loop)
+	a.loop.SetSystemPrompt(a.systemPrompt())
+	a.loop.Note(governedSwitchNote)
 	a.announceState()
 	return nil
+}
+
+// applyPlainPermissions installs the permissions of an ungoverned session.
+//
+// A stage owner's rules exist to divide a workflow's duties — the orchestrator
+// may not edit because the engineer does that — so with no workflow they
+// describe nothing, and keeping them in force is what makes plain mode refuse
+// an edit while advertising that every tool is available. An agent named with
+// -agent keeps its own rules: that restriction was the user's choice, not the
+// workflow's.
+//
+// The rules are stated rather than emptied because an unmatched edit or shell
+// action defaults to asking, and the TUI has no confirmation prompt yet, so an
+// empty rule set would refuse everything instead of allowing it.
+func (a *app) applyPlainPermissions() {
+	if a.perms == nil {
+		return
+	}
+	if a.agentExplicit && a.agentDef != nil {
+		a.perms.SetRules(a.agentDef.Permissions)
+		return
+	}
+	a.perms.SetRules(plainRules())
+}
+
+// plainRules are the permissions an ungoverned session runs under.
+func plainRules() []enforce.Rule {
+	return []enforce.Rule{
+		{Action: enforce.ActionEdit, Resource: "*", Effect: enforce.EffectAllow},
+		{Action: enforce.ActionShell, Resource: "*", Effect: enforce.EffectAllow},
+		{Action: enforce.ActionWebfetch, Resource: "*", Effect: enforce.EffectAllow},
+	}
+}
+
+// attachGovernance wires the hooks a governed loop needs. Both the initial
+// build and a mid-session switch go through here, so the two cannot drift.
+func (a *app) attachGovernance(loop *agent.Loop) {
+	loop.Task = a.task
+	// A handoff advances the state machine through the store, so the loop has
+	// to re-read the task or it would keep masking against the stage it has
+	// already left.
+	loop.TaskRefresh = func() (*workflow.Task, error) {
+		return a.ctl.Get(a.task.ID)
+	}
+	loop.OnStateChange = func(task *workflow.Task) {
+		a.task = task
+		a.syncActor()
+		a.retargetSession(loop)
+		// The prompt follows the stage owner as well: a new stage is a new
+		// identity, and its instructions are the ones that now apply.
+		loop.SetSystemPrompt(a.systemPrompt())
+		a.announceState()
+	}
+	loop.AdvanceStage = func(ctx context.Context) (bool, error) {
+		return a.advanceVerification(ctx, loop)
+	}
+}
+
+// advanceVerification runs the policy's gates when the workflow is waiting for
+// them, reporting whether the task moved on.
+//
+// Verification is the one stage the runtime owns rather than the model: there
+// is no tool it could call to advance it. Running the gates from inside the
+// loop, the moment that stage is entered, is what stops the model taking turns
+// in a stage where nothing it can do would help.
+func (a *app) advanceVerification(ctx context.Context, loop *agent.Loop) (bool, error) {
+	if a.ctl == nil || a.task == nil {
+		return false, nil
+	}
+	task, err := a.ctl.Get(a.task.ID)
+	if err != nil {
+		return false, err
+	}
+	if task.State != workflow.StateVerifying {
+		return false, nil
+	}
+
+	outcome := a.ctl.Verify(ctx, a.task.ID)
+	if outcome.Error != nil {
+		return false, outcome.Error
+	}
+	if outcome.Task == nil {
+		return false, nil
+	}
+	a.task = outcome.Task
+	loop.Task = outcome.Task
+	a.syncActor()
+	a.retargetSession(loop)
+	// The next stage has a different owner, so it gets that owner's prompt.
+	loop.SetSystemPrompt(a.systemPrompt())
+	a.announceState()
+	return outcome.Task.State != workflow.StateVerifying, nil
 }
 
 func (a *app) close() {
@@ -246,7 +374,25 @@ func (l *requestLogger) LogRequest(providerID string, body []byte) {
 }
 
 // build assembles the session from configuration and flags.
-func build(opts options, oneShot bool) (*app, error) {
+// build assembles the session and then settles the permissions its mode
+// implies.
+//
+// Assembly ends in a plain session by several routes — governance off, no
+// policy file, no git work tree — so the mode's rules are applied once here
+// rather than at each of those returns.
+func build(opts options) (*app, error) {
+	a, err := assemble(opts)
+	if err != nil {
+		return nil, err
+	}
+	if !a.governed {
+		a.applyPlainPermissions()
+	}
+	return a, nil
+}
+
+// assemble constructs the session from config, flags and the policy file.
+func assemble(opts options) (*app, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("locate home directory: %w", err)
@@ -284,6 +430,7 @@ func build(opts options, oneShot bool) (*app, error) {
 	}
 
 	agentName := opts.agentName
+	a.agentExplicit = agentName != ""
 	if agentName == "" {
 		agentName = cfg.DefaultAgent
 	}
@@ -401,7 +548,7 @@ func build(opts options, oneShot bool) (*app, error) {
 	if objective == "" {
 		objective = "interactive session"
 	}
-	a.task, err = a.ctl.Start(objective)
+	a.task, err = a.ctl.Start(context.Background(), objective)
 	if err != nil {
 		return nil, err
 	}
@@ -538,16 +685,84 @@ func registerCoreTools(r *tool.Registry, project string, agents *agent.Registry)
 	}
 }
 
-// systemPrompt assembles the agent prompt and its skills.
-func (a *app) systemPrompt() string {
-	var parts []string
-	if a.agentDef != nil && a.agentDef.Prompt != "" {
-		parts = append(parts, a.agentDef.Prompt)
-	} else {
-		parts = append(parts, "You are a careful software engineering assistant working in a terminal.")
+// plainPrompt is the identity of an ungoverned session. It states the absence
+// of a workflow rather than staying silent about it, because the conversation
+// may still contain turns from when there was one.
+const plainPrompt = "You are a careful software engineering assistant working in a terminal. " +
+	"This session has no workflow, no stages and no gates: there is nothing to plan through, " +
+	"delegate to or hand off. Carry out what is asked directly with the tools you have."
+
+// Notes handed to the model when governance changes mid-session. They are
+// short and declarative because their job is to contradict the earlier turns
+// still in context, not to explain the feature.
+const (
+	plainSwitchNote = "Governance has been switched OFF for this session. " +
+		"There is no workflow, no task and no stage, and the workflow_* tools are gone. " +
+		"Disregard any earlier workflow state; carry out requests directly."
+	governedSwitchNote = "Governance has been switched ON for this session. " +
+		"Work now proceeds through the workflow state machine and its gates, " +
+		"and only the tools listed for the current stage are available."
+)
+
+// promptAgent picks the identity whose instructions belong in the system
+// prompt.
+//
+// Governed, that is the agent owning the current stage — the same identity
+// masking and permissions already follow. Prompting as the orchestrator while
+// acting as the planner is unsatisfiable: the orchestrator's own prompt says
+// not to plan, while the planning stage offers only workflow_submit_plan.
+//
+// Plain, no stage owns the session and so no role prompt applies. A workflow
+// agent's instructions ("call workflow_start, do not implement yourself")
+// describe a workflow that is not running, which a model reads as a governed
+// session already in progress. An agent named with -agent is kept in both
+// modes, being a direct instruction from the user rather than a default.
+func (a *app) promptAgent() *agent.Definition {
+	if a.governed {
+		if def := a.stageOwnerDef(); def != nil {
+			return def
+		}
+		return a.agentDef
 	}
-	if a.agentDef != nil && len(a.agentDef.Skills) > 0 {
-		found, missing := a.skills.Resolve(a.agentDef.Skills)
+	if a.agentExplicit {
+		return a.agentDef
+	}
+	return nil
+}
+
+// stageOwnerDef returns the definition of the agent acting for the current
+// stage, or nil when there is none.
+func (a *app) stageOwnerDef() *agent.Definition {
+	if a.agents == nil || a.actor == nil || a.actor.AgentID == "" {
+		return nil
+	}
+	if def, ok := a.agents.Get(a.actor.AgentID); ok {
+		return def
+	}
+	return nil
+}
+
+// systemPrompt assembles the prompt for the identity the session is currently
+// running as, plus its skills.
+func (a *app) systemPrompt() string {
+	def := a.promptAgent()
+
+	var parts []string
+	if def != nil && def.Prompt != "" {
+		parts = append(parts, def.Prompt)
+	} else {
+		parts = append(parts, plainPrompt)
+	}
+
+	// Skills are reference material rather than role instructions, so a plain
+	// session keeps the configured agent's skills even when it drops that
+	// agent's prompt.
+	skillSource := def
+	if skillSource == nil {
+		skillSource = a.agentDef
+	}
+	if skillSource != nil && len(skillSource.Skills) > 0 {
+		found, missing := a.skills.Resolve(skillSource.Skills)
 		if prompt := skill.Prompt(found); prompt != "" {
 			parts = append(parts, prompt)
 		}
@@ -555,7 +770,7 @@ func (a *app) systemPrompt() string {
 		// than silently dropping it.
 		for _, name := range missing {
 			fmt.Fprintf(os.Stderr, "agentwarden: agent %q references unknown skill %q\n",
-				a.agentDef.Name, name)
+				skillSource.Name, name)
 		}
 	}
 	return strings.Join(parts, "\n\n")
@@ -569,30 +784,21 @@ func (a *app) newLoop(observer agent.Observer, confirmer agent.Confirmer) *agent
 		a.syncActor()
 	}
 	loop := &agent.Loop{
-		Provider:     a.provider,
-		Model:        a.modelID,
-		Tools:        a.tools,
-		Governor:     a.governor,
-		Permissions:  a.perms,
-		Confirmer:    confirmer,
-		Observer:     observer,
-		Task:         a.task,
-		Session:      &enforce.Session{Role: role, AgentID: a.actorAgentID()},
+		Provider:    a.provider,
+		Model:       a.modelID,
+		Tools:       a.tools,
+		Governor:    a.governor,
+		Permissions: a.perms,
+		Confirmer:   confirmer,
+		Observer:    observer,
+		Task:        a.task,
+		Session:     &enforce.Session{Role: role, AgentID: a.actorAgentID()},
+		// Assembled after syncActor above, so a governed session is prompted
+		// as the agent that owns its current stage.
 		SystemPrompt: a.systemPrompt(),
 	}
 	if a.governed {
-		// A handoff advances the state machine through the store, so the loop
-		// has to re-read the task or it would keep masking against the stage
-		// it has already left.
-		loop.TaskRefresh = func() (*workflow.Task, error) {
-			return a.ctl.Get(a.task.ID)
-		}
-		loop.OnStateChange = func(task *workflow.Task) {
-			a.task = task
-			a.syncActor()
-			a.retargetSession(loop)
-			a.announceState()
-		}
+		a.attachGovernance(loop)
 	}
 	return loop
 }
@@ -621,6 +827,91 @@ func (a *app) actorAgentID() string {
 		return a.agentDef.Name
 	}
 	return ""
+}
+
+// operatorActor is the identity a command-line action takes.
+//
+// The person at the terminal owns the workflow, so they act as the
+// orchestrator: resuming and cancelling are the orchestrator's to perform, and
+// there is no more authoritative actor than the operator.
+func (a *app) operatorActor() string {
+	if a.policy == nil {
+		return ""
+	}
+	return a.policy.AgentFor(workflow.RoleOrchestrator)
+}
+
+// printTasks lists the project's governed tasks, newest first.
+//
+// Recovering a task needs its ID, and the ID only otherwise appears in the
+// transcript of the session that created it.
+func (a *app) printTasks() error {
+	store := session.NewStore(config.StatePath(a.project))
+	ids, err := store.List()
+	if err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		fmt.Println("no governed tasks recorded for this project")
+		return nil
+	}
+
+	tasks := make([]*workflow.Task, 0, len(ids))
+	for _, id := range ids {
+		task, err := store.Load(id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "agentwarden: could not read task %s: %v\n", id, err)
+			continue
+		}
+		tasks = append(tasks, task)
+	}
+	sort.Slice(tasks, func(i, j int) bool {
+		return tasks[i].UpdatedAt.After(tasks[j].UpdatedAt)
+	})
+
+	for _, task := range tasks {
+		fmt.Printf("%s  %-18s %s  %s\n", task.ID, task.State,
+			task.UpdatedAt.Format("2006-01-02 15:04"), truncateLine(task.Objective, 48))
+	}
+	return nil
+}
+
+// truncateLine shortens text to one readable column.
+func truncateLine(text string, n int) string {
+	text = strings.TrimSpace(strings.ReplaceAll(text, "\n", " "))
+	if len(text) <= n {
+		return text
+	}
+	return text[:n-1] + "…"
+}
+
+// cancelTask closes a task the operator does not want finished.
+func (a *app) cancelTask(taskID string) error {
+	if a.ctl == nil {
+		return errors.New("no workflow policy is loaded for this project")
+	}
+	task, err := a.ctl.Cancel(taskID, a.operatorActor(), "cancelled by the operator")
+	if err != nil {
+		return err
+	}
+	fmt.Printf("task %s is now %s\n", task.ID, task.State)
+	return nil
+}
+
+// resumeTask reopens a blocked task.
+//
+// A blocked task has no tool the model could call to leave that state, so
+// without this it would stay blocked for good.
+func (a *app) resumeTask(taskID string) error {
+	if a.ctl == nil {
+		return errors.New("no workflow policy is loaded for this project")
+	}
+	task, err := a.ctl.Resume(taskID, a.operatorActor())
+	if err != nil {
+		return err
+	}
+	fmt.Printf("task %s is now %s\n", task.ID, task.State)
+	return nil
 }
 
 // printConfig reports the resolved configuration, for debugging setup.
@@ -852,29 +1143,16 @@ func (r *governedRunner) Run(ctx context.Context, prompt string) (agent.Result, 
 		return result, err
 	}
 
-	// Drive verification whenever the workflow is waiting for it. Running it
-	// here rather than inside the handoff tool keeps a long suite from
-	// blocking a single tool result for its whole timeout.
+	// The loop runs the gates itself the moment verification is entered, so
+	// this is only the safety net for a run that exited before reaching that
+	// check — a step-limit exhaustion, or a cancelled turn. Verify no-ops
+	// unless the task really is waiting to be verified.
 	for {
-		task, loadErr := r.app.ctl.Get(r.app.task.ID)
-		if loadErr != nil || task.State != workflow.StateVerifying {
-			break
+		advanced, verifyErr := r.app.advanceVerification(ctx, r.loop)
+		if verifyErr != nil {
+			return result, verifyErr
 		}
-		outcome := r.app.ctl.Verify(ctx, r.app.task.ID)
-		if outcome.Error != nil {
-			return result, outcome.Error
-		}
-		if outcome.Task != nil {
-			r.app.task = outcome.Task
-			r.loop.Task = outcome.Task
-			r.app.syncActor()
-			r.app.retargetSession(r.loop)
-			r.app.announceState()
-		}
-		if !r.app.policy.AutoAdvance() {
-			break
-		}
-		if outcome.Task == nil || outcome.Task.State != workflow.StateVerifying {
+		if !advanced || !r.app.policy.AutoAdvance() {
 			break
 		}
 	}

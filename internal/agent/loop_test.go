@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -75,6 +76,17 @@ func withHandoffs(r *tool.Registry, task *workflow.Task, machine *workflow.Machi
 	})
 	r.Add(handoffTool{
 		name: enforce.ToolSubmitImplementation, action: workflow.ActionImplementationSubmitted,
+		task: task, machine: machine,
+	})
+	// The later stages need theirs too: a stage whose advancing tool is not
+	// registered is one the model gets no turn in, so an incomplete fixture
+	// would look like a stalled workflow.
+	r.Add(handoffTool{
+		name: enforce.ToolSubmitQA, action: workflow.ActionQAApproved,
+		task: task, machine: machine,
+	})
+	r.Add(handoffTool{
+		name: enforce.ToolComplete, action: workflow.ActionCompleted,
 		task: task, machine: machine,
 	})
 	return r
@@ -773,7 +785,10 @@ func TestTaskRefreshKeepsMaskingCurrent(t *testing.T) {
 	loop := &Loop{
 		Provider: model,
 		Model:    "test",
-		Tools:    testTools(t),
+		// The handoff tools have to be registered even though this test never
+		// calls one: a stage that exposes no tool capable of advancing the
+		// workflow is not a stage the model is given a turn in.
+		Tools:    withHandoffs(testTools(t), task, workflow.NewMachine(newClock())),
 		Governor: enforce.New(policy, workflow.NewMachine(newClock()), ""),
 		Task:     task,
 		// Already handed off: the stage this session owned is finished, which
@@ -802,5 +817,209 @@ func TestTaskRefreshKeepsMaskingCurrent(t *testing.T) {
 	if !fake.OffersTool(requests[1], enforce.ToolEdit) {
 		t.Errorf("after the refresh, implementing should offer edit: %v",
 			fake.ToolNames(requests[1]))
+	}
+}
+
+// The verifying stage belongs to the runtime: nothing the model can see would
+// advance it. Sending it a request anyway is what produced a session that took
+// turn after turn narrating its own confusion until it hit the step limit.
+func TestVerifyingStageRunsGatesInsteadOfAskingTheModel(t *testing.T) {
+	policy := mustPolicy(t, testPolicy)
+	task := &workflow.Task{
+		ID: "t1", State: workflow.StateVerifying,
+		PolicyHash: policy.Hash(), Receipts: map[string]workflow.Receipt{},
+	}
+	// What the runtime's gate run leaves behind.
+	reviewed := &workflow.Task{
+		ID: "t1", State: workflow.StateQAReview,
+		PolicyHash: policy.Hash(), Receipts: map[string]workflow.Receipt{},
+	}
+
+	model := fake.New(fake.TextTurn("the review looks fine"))
+	advances := 0
+	loop := &Loop{
+		Provider: model,
+		Model:    "test",
+		Tools:    withHandoffs(testTools(t), task, workflow.NewMachine(newClock())),
+		Governor: enforce.New(policy, workflow.NewMachine(newClock()), ""),
+		Task:     task,
+		// Handing off is how the session reached verifying in the first place,
+		// so the stage it owned is already finished.
+		Session: &enforce.Session{HandedOff: true},
+		AdvanceStage: func(context.Context) (bool, error) {
+			advances++
+			return true, nil
+		},
+		TaskRefresh: func() (*workflow.Task, error) { return reviewed, nil },
+	}
+
+	if _, err := loop.Run(context.Background(), "finish the task"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if advances != 1 {
+		t.Errorf("the runtime should have been asked to advance once, got %d", advances)
+	}
+	if loop.Task.State != workflow.StateQAReview {
+		t.Errorf("state = %s, want qa_review", loop.Task.State)
+	}
+	// One request, for the qa_review stage — none for verifying.
+	requests := model.Requests()
+	if len(requests) != 1 {
+		t.Fatalf("want 1 request, got %d", len(requests))
+	}
+	if fake.OffersTool(requests[0], enforce.ToolSubmitImplementation) {
+		t.Errorf("the request was built for the wrong stage: %v", fake.ToolNames(requests[0]))
+	}
+}
+
+// When nobody can advance the stage the run has to end with an explanation
+// rather than spending every remaining step on it.
+func TestStageNobodyCanAdvanceEndsTheRun(t *testing.T) {
+	policy := mustPolicy(t, testPolicy)
+	task := &workflow.Task{
+		ID: "t1", State: workflow.StateVerifying,
+		PolicyHash: policy.Hash(), Receipts: map[string]workflow.Receipt{},
+	}
+
+	model := fake.New(fake.TextTurn("never asked"))
+	loop := &Loop{
+		Provider: model,
+		Model:    "test",
+		Tools:    withHandoffs(testTools(t), task, workflow.NewMachine(newClock())),
+		Governor: enforce.New(policy, workflow.NewMachine(newClock()), ""),
+		Task:     task,
+		Session:  &enforce.Session{},
+		// The gates did not move it on.
+		AdvanceStage: func(context.Context) (bool, error) { return false, nil },
+	}
+
+	result, err := loop.Run(context.Background(), "finish the task")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(model.Requests()) != 0 {
+		t.Errorf("the model should not have been asked anything, got %d requests",
+			len(model.Requests()))
+	}
+	if result.Steps != 0 {
+		t.Errorf("steps = %d, want 0", result.Steps)
+	}
+	if !strings.Contains(result.Text, "verifying") {
+		t.Errorf("the reason should name the stage: %q", result.Text)
+	}
+}
+
+// A terminal or blocked task must not be handed to the model either, and the
+// message should say what to do about it.
+func TestTerminalStagesEndTheRunWithAReason(t *testing.T) {
+	tests := []struct {
+		state workflow.State
+		want  string
+	}{
+		{workflow.StateComplete, "complete"},
+		{workflow.StateCancelled, "cancelled"},
+		{workflow.StateBlocked, "blocked"},
+	}
+	for _, tt := range tests {
+		policy := mustPolicy(t, testPolicy)
+		task := &workflow.Task{
+			ID: "t1", State: tt.state,
+			PolicyHash: policy.Hash(), Receipts: map[string]workflow.Receipt{},
+		}
+		model := fake.New(fake.TextTurn("never asked"))
+		loop := &Loop{
+			Provider: model,
+			Model:    "test",
+			Tools:    withHandoffs(testTools(t), task, workflow.NewMachine(newClock())),
+			Governor: enforce.New(policy, workflow.NewMachine(newClock()), ""),
+			Task:     task,
+			Session:  &enforce.Session{},
+		}
+		result, err := loop.Run(context.Background(), "carry on")
+		if err != nil {
+			t.Fatalf("%s: Run: %v", tt.state, err)
+		}
+		if len(model.Requests()) != 0 {
+			t.Errorf("%s: the model was asked anyway", tt.state)
+		}
+		if !strings.Contains(result.Text, tt.want) {
+			t.Errorf("%s: text = %q, want it to mention %q", tt.state, result.Text, tt.want)
+		}
+	}
+}
+
+// An ungoverned session has no stages, so the check must never fire there.
+func TestRuntimeStageCheckIgnoresPlainSessions(t *testing.T) {
+	model := fake.New(fake.TextTurn("hello"))
+	loop := &Loop{
+		Provider: model,
+		Model:    "test",
+		Tools:    testTools(t),
+		Governor: enforce.NewNop(),
+		Session:  &enforce.Session{},
+	}
+	result, err := loop.Run(context.Background(), "hi")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Text != "hello" {
+		t.Errorf("text = %q, want the model's reply", result.Text)
+	}
+	if len(model.Requests()) != 1 {
+		t.Errorf("want 1 request, got %d", len(model.Requests()))
+	}
+}
+
+// A hook that claims progress without making any would otherwise spin the loop
+// to the step limit.
+func TestAdvanceStageMustActuallyMoveTheState(t *testing.T) {
+	policy := mustPolicy(t, testPolicy)
+	task := &workflow.Task{
+		ID: "t1", State: workflow.StateVerifying,
+		PolicyHash: policy.Hash(), Receipts: map[string]workflow.Receipt{},
+	}
+	model := fake.New(fake.TextTurn("never asked"))
+	advances := 0
+	loop := &Loop{
+		Provider: model,
+		Model:    "test",
+		Tools:    withHandoffs(testTools(t), task, workflow.NewMachine(newClock())),
+		Governor: enforce.New(policy, workflow.NewMachine(newClock()), ""),
+		Task:     task,
+		Session:  &enforce.Session{},
+		AdvanceStage: func(context.Context) (bool, error) {
+			advances++
+			return true, nil // lies: the state never changes
+		},
+		TaskRefresh: func() (*workflow.Task, error) { return task, nil },
+	}
+	if _, err := loop.Run(context.Background(), "finish"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if advances != 1 {
+		t.Errorf("the loop should stop asking after the first no-op, got %d attempts", advances)
+	}
+}
+
+// A failing gate run is an error the user needs to see, not something to
+// retry silently.
+func TestAdvanceStageErrorSurfaces(t *testing.T) {
+	policy := mustPolicy(t, testPolicy)
+	task := &workflow.Task{
+		ID: "t1", State: workflow.StateVerifying,
+		PolicyHash: policy.Hash(), Receipts: map[string]workflow.Receipt{},
+	}
+	loop := &Loop{
+		Provider:     fake.New(fake.TextTurn("never asked")),
+		Model:        "test",
+		Tools:        withHandoffs(testTools(t), task, workflow.NewMachine(newClock())),
+		Governor:     enforce.New(policy, workflow.NewMachine(newClock()), ""),
+		Task:         task,
+		Session:      &enforce.Session{},
+		AdvanceStage: func(context.Context) (bool, error) { return false, errors.New("gate runner exploded") },
+	}
+	if _, err := loop.Run(context.Background(), "finish"); err == nil ||
+		!strings.Contains(err.Error(), "exploded") {
+		t.Errorf("err = %v, want the gate failure", err)
 	}
 }

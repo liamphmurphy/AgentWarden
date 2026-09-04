@@ -58,7 +58,7 @@ func NewTaskID() string {
 }
 
 // Start creates a task in the initial state.
-func (c *Controller) Start(objective string) (*workflow.Task, error) {
+func (c *Controller) Start(ctx context.Context, objective string) (*workflow.Task, error) {
 	if strings.TrimSpace(objective) == "" {
 		return nil, fmt.Errorf("a task needs an objective")
 	}
@@ -73,8 +73,15 @@ func (c *Controller) Start(objective string) (*workflow.Task, error) {
 		UpdatedAt:  now,
 	}
 	if !c.policy.RequirePlan() {
-		// Skipping the plan stage starts the work directly.
+		// Skipping the plan stage starts the work directly, which means the
+		// task opens in an editing stage and needs its baseline here: there
+		// is no plan submission to record one.
 		task.State = workflow.StateImplementing
+		baseline, err := c.finger.Fingerprint(ctx)
+		if err != nil {
+			return nil, err
+		}
+		recordBaseline(task, baseline)
 	}
 	if err := c.store.Create(task); err != nil {
 		return nil, err
@@ -100,17 +107,44 @@ func (c *Controller) requireActor(actual string, role workflow.Role, action stri
 }
 
 // SubmitPlan records a plan and advances to implementation.
-func (c *Controller) SubmitPlan(taskID, actor, plan string, criteria []string) (*workflow.Task, error) {
+func (c *Controller) SubmitPlan(ctx context.Context, taskID, actor, plan string, criteria []string) (*workflow.Task, error) {
 	if strings.TrimSpace(plan) == "" {
 		return nil, fmt.Errorf("a plan cannot be empty")
+	}
+	// Taken before the update: Fingerprint shells out to git, and the store's
+	// callback runs under the task lock.
+	baseline, err := c.finger.Fingerprint(ctx)
+	if err != nil {
+		return nil, err
 	}
 	return c.store.Update(taskID, func(task *workflow.Task) error {
 		if err := c.requireActor(actor, workflow.RolePlanner, "submitting a plan"); err != nil {
 			return err
 		}
 		task.Plan = renderPlan(plan, criteria)
-		return c.machine.Transition(task, workflow.ActionPlanSubmitted, actor, nil)
+		if err := c.machine.Transition(task, workflow.ActionPlanSubmitted, actor, nil); err != nil {
+			return err
+		}
+		recordBaseline(task, baseline)
+		return nil
 	})
+}
+
+// recordBaseline stores the current tree when a transition opens a stage where
+// the model may edit, and clears it otherwise.
+//
+// It runs after the transition, so it reads the state the task has arrived in
+// rather than the one it left. Clearing on the way out matters as much as
+// setting on the way in: a stale baseline from a previous round of edits would
+// compare a new submission against the wrong tree and let an empty one
+// through.
+func recordBaseline(task *workflow.Task, tree workflow.Fingerprint) {
+	if !workflow.IsEditingState(task.State) {
+		task.Baseline = nil
+		return
+	}
+	copied := tree
+	task.Baseline = &copied
 }
 
 func renderPlan(plan string, criteria []string) string {
@@ -129,16 +163,52 @@ func renderPlan(plan string, criteria []string) string {
 //
 // Every prior receipt and the QA verdict are cleared: evidence gathered
 // against an earlier tree says nothing about this one.
-func (c *Controller) SubmitImplementation(taskID, actor, summary string, files []string) (*workflow.Task, error) {
+//
+// The gates cannot catch a fabricated implementation: on an unchanged tree
+// every suite passes, so a placeholder submission sails through verification
+// and arrives at review with green receipts. The check therefore has to happen
+// here, and it has to be structural — the tree either moved or it did not.
+func (c *Controller) SubmitImplementation(ctx context.Context, taskID, actor, summary string, files []string) (*workflow.Task, error) {
+	if len(files) == 0 {
+		return nil, fmt.Errorf(
+			"an implementation must list the files it changed; " +
+				"if nothing has been written yet, do the work first")
+	}
+	current, err := c.finger.Fingerprint(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return c.store.Update(taskID, func(task *workflow.Task) error {
 		if err := c.requireActor(actor, workflow.RoleImplementer, "submitting an implementation"); err != nil {
 			return err
 		}
+		// A nil baseline means the task predates this check or arrived here by
+		// a path that recorded none. The files list is then the only guard
+		// available, so the submission is allowed rather than made
+		// unsatisfiable.
+		if task.Baseline != nil && task.Baseline.Same(current) {
+			return fmt.Errorf(
+				"the work tree is unchanged since implementation began, so there is "+
+					"no implementation to submit: %s is still at %s. Write the change first",
+				task.Baseline.Head, shortDigest(task.Baseline.Digest))
+		}
 		task.Handoff = renderHandoff(summary, files)
 		task.PolicyHash = c.policy.Hash()
 		enforce.InvalidateEvidence(task)
-		return c.machine.Transition(task, workflow.ActionImplementationSubmitted, actor, nil)
+		if err := c.machine.Transition(task, workflow.ActionImplementationSubmitted, actor, nil); err != nil {
+			return err
+		}
+		recordBaseline(task, current)
+		return nil
 	})
+}
+
+// shortDigest trims a fingerprint digest for a message.
+func shortDigest(digest string) string {
+	if len(digest) <= 12 {
+		return digest
+	}
+	return digest[:12]
 }
 
 func renderHandoff(summary string, files []string) string {
@@ -181,11 +251,19 @@ func (c *Controller) Verify(ctx context.Context, taskID string) GateOutcome {
 	// A policy edit invalidates the task's basis entirely, so send it back to
 	// implementation rather than verifying against changed rules.
 	if task.PolicyHash != c.policy.Hash() {
+		tree, fingerErr := c.finger.Fingerprint(ctx)
+		if fingerErr != nil {
+			return GateOutcome{Task: task, Error: fingerErr}
+		}
 		updated, updateErr := c.store.Update(taskID, func(task *workflow.Task) error {
 			enforce.InvalidateEvidence(task)
 			task.PolicyHash = c.policy.Hash()
-			return c.machine.Transition(task, workflow.ActionGateFailed, "controller",
-				map[string]string{"reason": "policy_changed"})
+			if err := c.machine.Transition(task, workflow.ActionGateFailed, "controller",
+				map[string]string{"reason": "policy_changed"}); err != nil {
+				return err
+			}
+			recordBaseline(task, tree)
+			return nil
 		})
 		return GateOutcome{Task: updated, Error: updateErr}
 	}
@@ -207,11 +285,23 @@ func (c *Controller) Verify(ctx context.Context, taskID string) GateOutcome {
 		action = workflow.ActionGatesVerified
 	}
 
+	// A failing gate sends the task back to implementation, which is a fresh
+	// editing stage and so needs its own baseline: without one, the next
+	// submission would be compared against the tree as it was two stages ago
+	// and an empty round of "fixes" would pass.
+	tree, fingerErr := c.finger.Fingerprint(ctx)
+	if fingerErr != nil {
+		return GateOutcome{Set: set, Task: task, Ran: true, Error: fingerErr}
+	}
 	updated, err := c.store.Update(taskID, func(task *workflow.Task) error {
 		for _, receipt := range set.Receipts {
 			task.Receipts[receipt.GateID] = receipt
 		}
-		return c.machine.Transition(task, action, "controller", metadata)
+		if err := c.machine.Transition(task, action, "controller", metadata); err != nil {
+			return err
+		}
+		recordBaseline(task, tree)
+		return nil
 	})
 	return GateOutcome{Set: set, Task: updated, Ran: true, Error: err}
 }
@@ -275,7 +365,14 @@ func (c *Controller) SubmitQA(ctx context.Context, taskID, actor, verdict, notes
 		if verdict == enforce.VerdictRejected {
 			action = workflow.ActionQARejected
 		}
-		return c.machine.Transition(task, action, actor, nil)
+		if err := c.machine.Transition(task, action, actor, nil); err != nil {
+			return err
+		}
+		// A rejection opens changes_requested, another editing stage: it gets
+		// the tree the reviewer just judged as its baseline, so "addressing
+		// the review" has to actually change something.
+		recordBaseline(task, fingerprint)
+		return nil
 	})
 }
 

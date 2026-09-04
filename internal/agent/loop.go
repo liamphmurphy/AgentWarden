@@ -96,12 +96,24 @@ type Loop struct {
 	// OnStateChange, when set, is called after the task's state advances, so
 	// the caller can retarget the session's identity to the new stage owner.
 	OnStateChange func(task *workflow.Task)
+	// AdvanceStage, when set, asks the caller to advance a stage that belongs
+	// to the runtime rather than the model — running the policy's gates for
+	// `verifying`. It reports whether the workflow actually moved on.
+	//
+	// This exists so verification happens the moment that stage is entered.
+	// Running it only after the whole run finished left the model taking turn
+	// after turn in a stage that offered it no tool capable of advancing
+	// anything, until it hit the step limit and narrated its confusion.
+	AdvanceStage func(ctx context.Context) (bool, error)
 
 	// messages is the running conversation.
 	messages []provider.Message
 	// lastFailure and failureStreak detect a model stuck repeating one call.
 	lastFailure   string
 	failureStreak int
+	// advanced records that the runtime moved the workflow on, so the loop
+	// takes another pass rather than counting it as a model step.
+	advanced bool
 }
 
 // Messages returns the conversation so far.
@@ -111,6 +123,46 @@ func (l *Loop) Messages() []provider.Message {
 
 // Reset clears the conversation, keeping configuration.
 func (l *Loop) Reset() { l.messages = nil }
+
+// SetSystemPrompt replaces the system prompt, including on a conversation
+// already under way.
+//
+// Assigning the field alone would not be enough: the prompt is copied into the
+// message list before the first turn and never re-read, so a session that
+// started under one identity would keep being instructed as that identity for
+// the rest of its life. Switching governance off has to be able to retract the
+// workflow instructions it switched on.
+func (l *Loop) SetSystemPrompt(prompt string) {
+	l.SystemPrompt = prompt
+	if len(l.messages) > 0 && l.messages[0].Role == provider.RoleSystem {
+		if prompt == "" {
+			l.messages = l.messages[1:]
+			return
+		}
+		l.messages[0].Text = prompt
+		return
+	}
+	if prompt != "" {
+		l.messages = append([]provider.Message{{
+			Role: provider.RoleSystem,
+			Text: prompt,
+		}}, l.messages...)
+	}
+}
+
+// Note appends an out-of-band message the model will read on its next turn.
+//
+// Rewriting the system prompt does not undo what the conversation already
+// says: earlier turns may contain workflow tool calls and their results, and a
+// small model reads that recent history as the current situation. A note is
+// how a mid-session change of rules is stated where the model is actually
+// looking.
+func (l *Loop) Note(text string) {
+	if text == "" {
+		return
+	}
+	l.messages = append(l.messages, provider.Message{Role: provider.RoleUser, Text: text})
+}
 
 // observer returns a non-nil Observer.
 func (l *Loop) observer() Observer {
@@ -169,6 +221,20 @@ func (l *Loop) Run(ctx context.Context, prompt string) (Result, error) {
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
+
+		// Some stages are not the model's to act in. Rather than send a
+		// request the model cannot usefully answer, hand the stage to the
+		// runtime; if nobody can advance it, stop and say so.
+		if stalled, err := l.stageBelongsToRuntime(ctx); err != nil {
+			return result, err
+		} else if stalled != "" {
+			result.Text = stalled
+			return result, nil
+		} else if l.advanced {
+			l.advanced = false
+			continue
+		}
+
 		result.Steps++
 
 		text, calls, usage, err := l.turn(ctx)
@@ -223,6 +289,79 @@ func (l *Loop) Run(ctx context.Context, prompt string) (Result, error) {
 		}
 	}
 	return result, fmt.Errorf("gave up after %d steps without a final answer", maxSteps)
+}
+
+// stageBelongsToRuntime handles a stage the model cannot advance.
+//
+// It returns a message to finish the run with when the workflow is stuck
+// there, "" when the loop should carry on, and sets l.advanced when the stage
+// was handed to the runtime and moved.
+func (l *Loop) stageBelongsToRuntime(ctx context.Context) (string, error) {
+	if !l.Governor.Enabled() {
+		return "", nil
+	}
+	visible := l.Governor.VisibleTools(l.task(), l.session(), l.Tools.Defs())
+	if canAdvanceWorkflow(visible) {
+		return "", nil
+	}
+
+	state := l.task().State
+	if l.AdvanceStage != nil {
+		advanced, err := l.AdvanceStage(ctx)
+		if err != nil {
+			return "", err
+		}
+		l.refreshTask()
+		// A hook that claims progress without making any would spin here to
+		// the step limit, so the state is checked rather than trusted.
+		if advanced && l.task().State != state {
+			l.advanced = true
+			return "", nil
+		}
+	}
+	return stageStall(l.task()), nil
+}
+
+// canAdvanceWorkflow reports whether any visible tool could move the workflow
+// on. Status and history only report, so they do not count.
+//
+// This is decided from the masked tool list rather than from the state name,
+// so a policy that declares its own states is judged by what it actually
+// exposes.
+func canAdvanceWorkflow(visible []provider.ToolDef) bool {
+	for _, def := range visible {
+		if !enforce.IsWorkflowTool(def.Name) {
+			continue
+		}
+		if def.Name == enforce.ToolStatus || def.Name == enforce.ToolHistory {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// stageStall explains why the run ended without asking the model anything.
+//
+// The task ID is included where the way out is an operator command, since the
+// ID otherwise appears only in the transcript of the session that made it.
+func stageStall(task *workflow.Task) string {
+	switch task.State {
+	case workflow.StateComplete:
+		return "The task is complete; there is nothing further to do."
+	case workflow.StateCancelled:
+		return "The task was cancelled."
+	case workflow.StateBlocked:
+		return fmt.Sprintf(
+			"The task is blocked and nothing here can unblock it. "+
+				"Resume it with `agentwarden -resume %s`, or drop it with `agentwarden -cancel %s`.",
+			task.ID, task.ID)
+	default:
+		return fmt.Sprintf(
+			"The workflow is in %s, which the runtime owns rather than the model, and it "+
+				"did not advance. Check the gate output, or drop the task with "+
+				"`agentwarden -cancel %s`.", task.State, task.ID)
+	}
 }
 
 // turn issues one request and collects its output.

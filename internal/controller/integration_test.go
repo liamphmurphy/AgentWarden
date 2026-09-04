@@ -99,18 +99,42 @@ func TestRealGateBlocksThenPasses(t *testing.T) {
 
 	ctx := context.Background()
 
-	task, err := ctl.Start("fix the Add function")
+	task, err := ctl.Start(context.Background(), "fix the Add function")
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if _, err := ctl.SubmitPlan(task.ID, "tech-lead", "correct the operator", []string{"go test passes"}); err != nil {
+	if _, err := ctl.SubmitPlan(ctx, task.ID, "tech-lead", "correct the operator",
+		[]string{"go test passes"}); err != nil {
 		t.Fatalf("SubmitPlan: %v", err)
 	}
-	if _, err := ctl.SubmitImplementation(task.ID, "engineer", "claimed to fix it", []string{"add.go"}); err != nil {
+
+	// Claiming a fix without touching the tree is refused here, before any
+	// gate runs. It has to be: on an unchanged tree every suite passes, so a
+	// placeholder submission would reach review with green receipts.
+	if _, err := ctl.SubmitImplementation(ctx, task.ID, "engineer", "claimed to fix it",
+		[]string{"add.go"}); err == nil {
+		t.Fatal("a submission that changed nothing should be refused")
+	} else if !strings.Contains(err.Error(), "unchanged") {
+		t.Errorf("refusal should name the cause, got %v", err)
+	}
+	if current, err := ctl.Get(task.ID); err != nil {
+		t.Fatal(err)
+	} else if current.State != workflow.StateImplementing {
+		t.Errorf("state = %s, want to stay in implementing", current.State)
+	}
+
+	// A wrong fix does change the tree, so it is accepted — and then the real
+	// gate is what catches it.
+	if err := os.WriteFile(filepath.Join(dir, "add.go"),
+		[]byte("package demo\n\nfunc Add(a, b int) int { return a * b }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ctl.SubmitImplementation(ctx, task.ID, "engineer", "changed the operator",
+		[]string{"add.go"}); err != nil {
 		t.Fatalf("SubmitImplementation: %v", err)
 	}
 
-	// The engineer claimed a fix but changed nothing, so the real gate fails.
+	// The fix is wrong, so the real gate fails.
 	outcome := ctl.Verify(ctx, task.ID)
 	if outcome.Error != nil {
 		t.Fatalf("Verify: %v", outcome.Error)
@@ -142,7 +166,8 @@ func TestRealGateBlocksThenPasses(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := ctl.SubmitImplementation(task.ID, "engineer", "fixed the operator", []string{"add.go"}); err != nil {
+	if _, err := ctl.SubmitImplementation(ctx, task.ID, "engineer", "fixed the operator",
+		[]string{"add.go"}); err != nil {
 		t.Fatalf("SubmitImplementation: %v", err)
 	}
 	outcome = ctl.Verify(ctx, task.ID)
@@ -200,9 +225,21 @@ func TestRealEditAfterPassInvalidatesEvidence(t *testing.T) {
 	ctl := New(policy, machine, store, gates, finger, clock)
 	ctx := context.Background()
 
-	task, _ := ctl.Start("keep it working")
-	ctl.SubmitPlan(task.ID, "tech-lead", "no change needed", []string{"tests pass"})
-	ctl.SubmitImplementation(task.ID, "engineer", "already correct", nil)
+	task, _ := ctl.Start(context.Background(), "keep it working")
+	if _, err := ctl.SubmitPlan(ctx, task.ID, "tech-lead", "add a helper",
+		[]string{"tests pass"}); err != nil {
+		t.Fatalf("SubmitPlan: %v", err)
+	}
+	// A real change that keeps the suite green, so the gate passes and the
+	// staleness check below is what is under test.
+	if err := os.WriteFile(filepath.Join(dir, "helper.go"),
+		[]byte("package demo\n\nfunc Double(a int) int { return a * 2 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ctl.SubmitImplementation(ctx, task.ID, "engineer", "added a helper",
+		[]string{"helper.go"}); err != nil {
+		t.Fatalf("SubmitImplementation: %v", err)
+	}
 
 	outcome := ctl.Verify(ctx, task.ID)
 	if outcome.Error != nil || !outcome.Set.Passed {

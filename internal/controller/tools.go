@@ -53,7 +53,7 @@ func (SubmitPlanTool) Def() provider.ToolDef {
 	}
 }
 
-func (t SubmitPlanTool) Run(_ context.Context, call tool.Call) (tool.Result, error) {
+func (t SubmitPlanTool) Run(ctx context.Context, call tool.Call) (tool.Result, error) {
 	var args struct {
 		Plan               string   `json:"plan"`
 		AcceptanceCriteria []string `json:"acceptance_criteria"`
@@ -64,7 +64,7 @@ func (t SubmitPlanTool) Run(_ context.Context, call tool.Call) (tool.Result, err
 	if len(args.AcceptanceCriteria) == 0 {
 		return errResult("a plan must state at least one observable acceptance criterion")
 	}
-	task, err := t.Ctl.SubmitPlan(t.Actor.TaskID, t.Actor.AgentID, args.Plan, args.AcceptanceCriteria)
+	task, err := t.Ctl.SubmitPlan(ctx, t.Actor.TaskID, t.Actor.AgentID, args.Plan, args.AcceptanceCriteria)
 	if err != nil {
 		return errResult("%v", err)
 	}
@@ -85,14 +85,15 @@ func (SubmitImplementationTool) Def() provider.ToolDef {
 		Parameters: objectSchema(map[string]any{
 			"summary": map[string]any{"type": "string", "description": "What changed and why."},
 			"files_changed": map[string]any{
-				"type":  "array",
-				"items": map[string]any{"type": "string"},
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "Every file actually written. The runtime checks the work tree changed.",
 			},
-		}, "summary"),
+		}, "summary", "files_changed"),
 	}
 }
 
-func (t SubmitImplementationTool) Run(_ context.Context, call tool.Call) (tool.Result, error) {
+func (t SubmitImplementationTool) Run(ctx context.Context, call tool.Call) (tool.Result, error) {
 	var args struct {
 		Summary      string   `json:"summary"`
 		FilesChanged []string `json:"files_changed"`
@@ -103,7 +104,7 @@ func (t SubmitImplementationTool) Run(_ context.Context, call tool.Call) (tool.R
 	if strings.TrimSpace(args.Summary) == "" {
 		return errResult("a summary of the change is required")
 	}
-	task, err := t.Ctl.SubmitImplementation(t.Actor.TaskID, t.Actor.AgentID, args.Summary, args.FilesChanged)
+	task, err := t.Ctl.SubmitImplementation(ctx, t.Actor.TaskID, t.Actor.AgentID, args.Summary, args.FilesChanged)
 	if err != nil {
 		return errResult("%v", err)
 	}

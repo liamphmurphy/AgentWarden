@@ -65,37 +65,87 @@ editing a test to make a change pass, stop and reconsider the change.
    that a command passed is never evidence. If you add a path where the model
    can report a gate result, you have broken the feature.
 
-3. **Gate commands are argv, executed without a shell.** `ExecRunner` must
+3. **An implementation handoff must prove the tree moved.** The work tree is
+   fingerprinted on entry to every editing stage, and
+   `SubmitImplementation` refuses a submission whose fingerprint still equals
+   that baseline. Gates cannot cover this: on an unchanged tree every suite
+   passes, so a placeholder submission reaches review with a full set of green
+   receipts — which is exactly what happened four times in one repository
+   before the check existed. Never relax it to a warning, and never let a
+   transition into an editing stage skip `recordBaseline`. See
+   `TestSubmitImplementationRefusesAnUnchangedTree` and
+   `TestRealGateBlocksThenPasses`.
+
+4. **A stage the model cannot advance is never given a turn.** If nothing in
+   the masked tool list could move the workflow on, the loop hands the stage
+   to the runtime (`AdvanceStage`, which runs the gates for `verifying`) or
+   ends the run with the reason. Verification therefore happens the moment
+   that stage is entered, not after the run. Running it later left a model
+   taking thirteen turns in a stage offering it four read-only tools before it
+   gave up and reported a blocker that was not true. `AdvanceStage` must also
+   report *actual* movement, or the loop spins to the step limit: the state is
+   compared, not trusted. See
+   `TestVerifyingStageRunsGatesInsteadOfAskingTheModel` and
+   `TestAdvanceStageMustActuallyMoveTheState`.
+
+5. **Gate commands are argv, executed without a shell.** `ExecRunner` must
    never grow a `sh -c`. The agent-facing `bash` tool is different and
    deliberately does use a shell.
 
-4. **Evidence expires when its inputs move.** `VerificationProblem` is the
+6. **Evidence expires when its inputs move.** `VerificationProblem` is the
    single staleness predicate: policy hash, passing receipt, receipt's policy
    hash, work-tree fingerprint. Adding a caller that skips it reintroduces
    "the tests passed ten edits ago".
 
-5. **Fingerprinting fails closed.** Outside a git work tree, a governed
+7. **Fingerprinting fails closed.** Outside a git work tree, a governed
    session refuses to start. Do not add a fallback that guesses.
 
-6. **`.agentwarden/state` is excluded from the fingerprint.** This is a fixed bug,
+8. **`.agentwarden/state` is excluded from the fingerprint.** This is a fixed bug,
    not an optimization: the store writes receipts *inside* the repository it
    fingerprints, so without the exclusion saving a receipt invalidates that
    receipt. See `TestFingerprintExcludesAgentwardenState`.
 
-7. **The actor follows the stage owner.** A single session performs each stage
-   in turn, so its identity must track `enforce.RoleForState`. This is also a
-   fixed bug: when the session ran as `orchestrator` throughout, masking
+9. **Everything about identity follows the stage owner.** A single session
+   performs each stage in turn, so the actor, the permission rules *and* the
+   system prompt must all track `enforce.RoleForState`. Each was a separate
+   fixed bug. When the session ran as `orchestrator` throughout, masking
    offered `workflow_submit_plan` while the actor check refused it, leaving
-   the workflow unsatisfiable.
+   the workflow unsatisfiable. When the rules stayed the planner's, the
+   implementing stage was denied the edit it exists to make. When the prompt
+   stayed the orchestrator's, the model was told "do not plan yourself" by a
+   stage whose only handoff is `workflow_submit_plan`. See `syncActor`,
+   `syncPermissions`, `promptAgent` and `TestGovernedPromptFollowsStageOwner`.
 
-8. **Deny by default.** Unknown `(state, action)` pairs are rejected; unknown
+10. **Plain mode carries no workflow state.** Switching governance off must
+   drop all of it together: the loop's task, the session role and its
+   counters, the state-change hooks, the stage owner's prompt and the stage
+   owner's permissions — and `Nop` withholds the `workflow_*` tools. Those
+   tools are not inert; they advance stored state through the controller, so an
+   ungoverned session holding them could complete a task with no gate checked.
+   A leftover of any kind produces a plain session that still narrates a
+   planning stage and refuses the edit it was just asked for. Because the
+   switch happens mid-conversation, `Loop.SetSystemPrompt` rewrites the stored
+   system message rather than only the field — the prompt is copied into the
+   message list before the first turn and never re-read. See
+   `TestPlainModeDropsWorkflowState`, `TestModeSwitchRewritesLivePrompt` and
+   `TestNopPermitsEverythingButTheStateMachine`.
+
+11. **The panel never invents a number it was not given.** Token counts show
+   `not reported` until an endpoint actually returns usage, and context is a
+   percentage only when `contextWindow` is configured — an OpenAI-compatible
+   endpoint reports tokens *used*, never tokens *accepted*. Context pressure is
+   the newest prompt, not the sum of prompts: every turn resends the
+   conversation. See `TestStatusPaneUnreportedUsage` and
+   `TestStatusPaneWithoutContextWindow`.
+
+12. **Deny by default.** Unknown `(state, action)` pairs are rejected; unknown
    states get read-only tools. Adding a state must never widen access by
    accident.
 
-9. **`--auto` never overrides an explicit `deny`.** It upgrades `ask` to
+13. **`--auto` never overrides an explicit `deny`.** It upgrades `ask` to
    `allow` and nothing else.
 
-10. **A live switch must change the thing, never just the label.** This
+14. **A live switch must change the thing, never just the label.** This
     applies to both switchers. `tui.Model.Governed` and `tui.Model.ModelName`
     only decide what the status bar says; enforcement lives in
     `agent.Loop.Governor` and the endpoint in `agent.Loop.Provider`. Changes go
@@ -104,7 +154,7 @@ editing a test to make a change pass, stop and reconsider the change.
     `TestSwitchDelegatesRatherThanRelabelling` and
     `TestFailedModelSwitchDoesNotRelabel`.
 
-11. **An open picker owns the keyboard.** `handleKey` checks
+15. **An open picker owns the keyboard.** `handleKey` checks
     `picker.IsOpen()` before the normal bindings, so `enter` selects a row
     rather than submitting the half-typed prompt behind the overlay, and the
     arrow keys drive the picker rather than the prompt history.
@@ -114,13 +164,13 @@ editing a test to make a change pass, stop and reconsider the change.
     History only engages at the edge line (`input.Line() == 0` for up, the last
     line for down) so a multi-line draft still navigates normally.
 
-12. **Terminal capability detection happens before the program starts.**
+16. **Terminal capability detection happens before the program starts.**
     Querying the background colour writes an escape sequence and reads the
     reply; once Bubble Tea owns stdin, that reply is read as keystrokes and
     appears as junk in the prompt. `tui.DetectTheme` is the only place allowed
     to do it, enforced by an AST check in `TestNoTerminalQueryingAPIsInModel`.
 
-13. **Filesystem tools stay confined to the project root.** `tool.resolve`
+17. **Filesystem tools stay confined to the project root.** `tool.resolve`
     handles the awkward cases (a file that does not exist yet, a symlinked
     root such as macOS `/tmp` → `/private/tmp`). Don't simplify it back into a
     prefix comparison.

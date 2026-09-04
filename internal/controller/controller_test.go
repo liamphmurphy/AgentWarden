@@ -95,14 +95,20 @@ func newHarness(t *testing.T, doc string) *harness {
 // advanceToVerifying walks a fresh task through plan and implementation.
 func (h *harness) advanceToVerifying(t *testing.T) *workflow.Task {
 	t.Helper()
-	task, err := h.ctl.Start("add request timeouts")
+	task, err := h.ctl.Start(context.Background(), "add request timeouts")
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if _, err := h.ctl.SubmitPlan(task.ID, "tech-lead", "the plan", []string{"tests pass"}); err != nil {
+	if _, err := h.ctl.SubmitPlan(context.Background(), task.ID, "tech-lead", "the plan",
+		[]string{"tests pass"}); err != nil {
 		t.Fatalf("SubmitPlan: %v", err)
 	}
-	updated, err := h.ctl.SubmitImplementation(task.ID, "engineer", "did the work", []string{"client.go"})
+	// The implementing stage writes code, so the tree moves. Without this the
+	// submission below is refused for changing nothing, which is the point of
+	// the baseline check.
+	h.finger.current = workflow.Fingerprint{Head: "h1", Digest: "d2"}
+	updated, err := h.ctl.SubmitImplementation(context.Background(), task.ID, "engineer",
+		"did the work", []string{"client.go"})
 	if err != nil {
 		t.Fatalf("SubmitImplementation: %v", err)
 	}
@@ -178,15 +184,17 @@ func TestWrongActorRejectedAtEveryStage(t *testing.T) {
 		call func(h *harness, taskID string) error
 	}{
 		{"plan by engineer", func(h *harness, id string) error {
-			_, err := h.ctl.SubmitPlan(id, "engineer", "plan", nil)
+			_, err := h.ctl.SubmitPlan(context.Background(), id, "engineer", "plan", nil)
 			return err
 		}},
 		{"implementation by tech-lead", func(h *harness, id string) error {
-			_, err := h.ctl.SubmitPlan(id, "tech-lead", "plan", nil)
+			_, err := h.ctl.SubmitPlan(context.Background(), id, "tech-lead", "plan", nil)
 			if err != nil {
 				return err
 			}
-			_, err = h.ctl.SubmitImplementation(id, "tech-lead", "work", nil)
+			h.finger.current = workflow.Fingerprint{Head: "h1", Digest: "d2"}
+			_, err = h.ctl.SubmitImplementation(context.Background(), id, "tech-lead", "work",
+				[]string{"a.go"})
 			return err
 		}},
 		{"resume by engineer", func(h *harness, id string) error {
@@ -205,7 +213,7 @@ func TestWrongActorRejectedAtEveryStage(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, policyDoc)
-			task, err := h.ctl.Start("objective")
+			task, err := h.ctl.Start(context.Background(), "objective")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -252,7 +260,9 @@ func TestResubmissionClearsEvidence(t *testing.T) {
 		t.Fatalf("SubmitQA: %v", err)
 	}
 
-	resubmitted, err := h.ctl.SubmitImplementation(task.ID, "engineer", "fixed it", nil)
+	h.finger.current = workflow.Fingerprint{Head: "h1", Digest: "d4"}
+	resubmitted, err := h.ctl.SubmitImplementation(context.Background(), task.ID, "engineer",
+		"fixed it", []string{"client.go"})
 	if err != nil {
 		t.Fatalf("SubmitImplementation: %v", err)
 	}
@@ -363,7 +373,7 @@ func TestPolicyChangeReturnsToImplementing(t *testing.T) {
 // check, where any bound agent could park a workflow.
 func TestBlockRequiresAuthorizedActor(t *testing.T) {
 	h := newHarness(t, policyDoc)
-	task, err := h.ctl.Start("objective")
+	task, err := h.ctl.Start(context.Background(), "objective")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +398,7 @@ func TestBlockRequiresAuthorizedActor(t *testing.T) {
 
 func TestBlockRequiresReason(t *testing.T) {
 	h := newHarness(t, policyDoc)
-	task, _ := h.ctl.Start("objective")
+	task, _ := h.ctl.Start(context.Background(), "objective")
 	if _, err := h.ctl.Block(task.ID, "orchestrator", "   "); err == nil {
 		t.Error("blocking without a reason should be refused")
 	}
@@ -417,7 +427,7 @@ func TestBlockResumeReturnsToSameStage(t *testing.T) {
 
 func TestVerifyRefusesOutsideVerifying(t *testing.T) {
 	h := newHarness(t, policyDoc)
-	task, err := h.ctl.Start("objective")
+	task, err := h.ctl.Start(context.Background(), "objective")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -432,15 +442,15 @@ func TestVerifyRefusesOutsideVerifying(t *testing.T) {
 
 func TestStartRequiresObjective(t *testing.T) {
 	h := newHarness(t, policyDoc)
-	if _, err := h.ctl.Start("  "); err == nil {
+	if _, err := h.ctl.Start(context.Background(), "  "); err == nil {
 		t.Error("an empty objective should be refused")
 	}
 }
 
 func TestSubmitPlanRequiresContent(t *testing.T) {
 	h := newHarness(t, policyDoc)
-	task, _ := h.ctl.Start("objective")
-	if _, err := h.ctl.SubmitPlan(task.ID, "tech-lead", "   ", nil); err == nil {
+	task, _ := h.ctl.Start(context.Background(), "objective")
+	if _, err := h.ctl.SubmitPlan(context.Background(), task.ID, "tech-lead", "   ", nil); err == nil {
 		t.Error("an empty plan should be refused")
 	}
 }
@@ -497,7 +507,7 @@ gates:
     command: ["true"]
     required: true
 `)
-	task, err := h.ctl.Start("objective")
+	task, err := h.ctl.Start(context.Background(), "objective")
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -572,5 +582,196 @@ func TestNewTaskIDIsUnique(t *testing.T) {
 			t.Fatalf("duplicate id %q", id)
 		}
 		seen[id] = true
+	}
+}
+
+// The task that prompted this check reached qa_review with three green
+// receipts and a handoff reading "No changes yet — this is a placeholder
+// submission to unblock the state machine". Gates cannot catch that: on an
+// unchanged tree every suite passes. Only the tree itself can.
+func TestSubmitImplementationRefusesAnUnchangedTree(t *testing.T) {
+	h := newHarness(t, policyDoc)
+	task, err := h.ctl.Start(context.Background(), "add request timeouts")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := h.ctl.SubmitPlan(context.Background(), task.ID, "tech-lead", "the plan",
+		[]string{"tests pass"}); err != nil {
+		t.Fatalf("SubmitPlan: %v", err)
+	}
+
+	// No edit: the fingerprint still matches the baseline taken on entry.
+	_, err = h.ctl.SubmitImplementation(context.Background(), task.ID, "engineer",
+		"placeholder to unblock the state machine", []string{"client.go"})
+	if err == nil {
+		t.Fatal("a submission that changed nothing was accepted")
+	}
+	if !strings.Contains(err.Error(), "unchanged") {
+		t.Errorf("the refusal should name the cause, got %v", err)
+	}
+
+	// And the task must stay where it was, not half-advance.
+	current, err := h.ctl.Get(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State != workflow.StateImplementing {
+		t.Errorf("state = %s, want implementing", current.State)
+	}
+
+	// Once something is actually written, the same submission goes through.
+	h.finger.current = workflow.Fingerprint{Head: "h1", Digest: "d2"}
+	advanced, err := h.ctl.SubmitImplementation(context.Background(), task.ID, "engineer",
+		"added the timeouts", []string{"client.go"})
+	if err != nil {
+		t.Fatalf("SubmitImplementation after a real edit: %v", err)
+	}
+	if advanced.State != workflow.StateVerifying {
+		t.Errorf("state = %s, want verifying", advanced.State)
+	}
+}
+
+// An empty files list is the honest version of the same fraud, and is cheap to
+// catch before any git call.
+func TestSubmitImplementationRequiresFiles(t *testing.T) {
+	h := newHarness(t, policyDoc)
+	task, _ := h.ctl.Start(context.Background(), "objective")
+	if _, err := h.ctl.SubmitPlan(context.Background(), task.ID, "tech-lead", "plan", nil); err != nil {
+		t.Fatal(err)
+	}
+	h.finger.current = workflow.Fingerprint{Head: "h1", Digest: "d2"}
+
+	for _, files := range [][]string{nil, {}} {
+		_, err := h.ctl.SubmitImplementation(context.Background(), task.ID, "engineer",
+			"did the work", files)
+		if err == nil {
+			t.Fatalf("files=%v should be refused", files)
+		}
+		if !strings.Contains(err.Error(), "files it changed") {
+			t.Errorf("files=%v: unhelpful refusal %v", files, err)
+		}
+	}
+}
+
+// A rejected review opens changes_requested, so that stage needs its own
+// baseline: otherwise "I addressed the review" could change nothing and be
+// compared against a tree from two stages ago.
+func TestChangesRequestedGetsItsOwnBaseline(t *testing.T) {
+	h := newHarness(t, policyDoc)
+	task := h.advanceToVerifying(t)
+	if outcome := h.ctl.Verify(context.Background(), task.ID); outcome.Error != nil {
+		t.Fatalf("Verify: %v", outcome.Error)
+	}
+	if _, err := h.ctl.SubmitQA(context.Background(), task.ID, "qa-engineer",
+		enforce.VerdictRejected, "needs work"); err != nil {
+		t.Fatalf("SubmitQA: %v", err)
+	}
+
+	current, err := h.ctl.Get(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State != workflow.StateChangesRequested {
+		t.Fatalf("state = %s, want changes_requested", current.State)
+	}
+	if current.Baseline == nil {
+		t.Fatal("changes_requested recorded no baseline")
+	}
+
+	// Resubmitting without touching anything is refused.
+	if _, err := h.ctl.SubmitImplementation(context.Background(), task.ID, "engineer",
+		"addressed the review", []string{"client.go"}); err == nil {
+		t.Error("an empty round of changes was accepted")
+	}
+}
+
+// A failing gate returns the task to implementing, which is a fresh editing
+// stage: the retry must have to change something too.
+func TestGateFailureRebaselines(t *testing.T) {
+	h := newHarness(t, policyDoc)
+	h.runner.failures["unit"] = true
+	task := h.advanceToVerifying(t)
+
+	outcome := h.ctl.Verify(context.Background(), task.ID)
+	if outcome.Error != nil {
+		t.Fatalf("Verify: %v", outcome.Error)
+	}
+	if outcome.Task.State != workflow.StateImplementing {
+		t.Fatalf("state = %s, want implementing", outcome.Task.State)
+	}
+	if outcome.Task.Baseline == nil {
+		t.Fatal("the reopened implementing stage recorded no baseline")
+	}
+
+	if _, err := h.ctl.SubmitImplementation(context.Background(), task.ID, "engineer",
+		"tried again", []string{"client.go"}); err == nil {
+		t.Error("a retry that changed nothing was accepted")
+	}
+}
+
+// The baseline is cleared on the way out of an editing stage, so a stale one
+// can never be compared against later.
+func TestBaselineClearedOutsideEditingStages(t *testing.T) {
+	h := newHarness(t, policyDoc)
+	task := h.advanceToVerifying(t)
+	if task.State != workflow.StateVerifying {
+		t.Fatalf("state = %s, want verifying", task.State)
+	}
+	if task.Baseline != nil {
+		t.Errorf("verifying is not an editing stage but carries a baseline: %+v", task.Baseline)
+	}
+}
+
+func TestIsEditingState(t *testing.T) {
+	editing := []workflow.State{workflow.StateImplementing, workflow.StateChangesRequested}
+	for _, s := range editing {
+		if !workflow.IsEditingState(s) {
+			t.Errorf("%s should be an editing state", s)
+		}
+	}
+	for _, s := range []workflow.State{
+		workflow.StatePlanning, workflow.StateVerifying, workflow.StateQAReview,
+		workflow.StateReadyToComplete, workflow.StateComplete, workflow.StateBlocked,
+		workflow.StateCancelled,
+	} {
+		if workflow.IsEditingState(s) {
+			t.Errorf("%s should not be an editing state", s)
+		}
+	}
+}
+
+// With require_plan off a task opens directly in implementing, so Start is
+// where its baseline has to come from: there is no plan submission to record
+// one, and without it the check would silently not apply to exactly the
+// simplified policy a small model is most likely to be given.
+func TestStartRecordsBaselineWhenPlanningIsSkipped(t *testing.T) {
+	const noPlanPolicy = `
+version: 1
+workflow:
+  require_plan: false
+  require_independent_qa: false
+roles:
+  orchestrator: orchestrator
+  implementer: engineer
+gates:
+  - id: unit
+    command: ["true"]
+    required: true
+`
+	h := newHarness(t, noPlanPolicy)
+	task, err := h.ctl.Start(context.Background(), "fix it")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if task.State != workflow.StateImplementing {
+		t.Fatalf("state = %s, want implementing", task.State)
+	}
+	if task.Baseline == nil {
+		t.Fatal("a task opening in an editing stage recorded no baseline")
+	}
+
+	if _, err := h.ctl.SubmitImplementation(context.Background(), task.ID, "engineer",
+		"nothing really", []string{"a.go"}); err == nil {
+		t.Error("a submission that changed nothing was accepted")
 	}
 }

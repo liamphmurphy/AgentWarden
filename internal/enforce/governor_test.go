@@ -13,16 +13,36 @@ var (
 	_ Governor = Nop{}
 )
 
-// TestNopIsFullyPermissive backs the quick path: --no-workflow, agentwarden run
-// and /plain must impose nothing at all.
-func TestNopIsFullyPermissive(t *testing.T) {
+// TestNopPermitsEverythingButTheStateMachine backs the quick path:
+// --no-workflow, agentwarden run and /plain impose nothing on ordinary work.
+// The workflow tools are the exception, because they are not inert — they
+// advance stored task state through the controller, so an ungoverned session
+// holding them could submit a plan or complete a task with no gate checked.
+func TestNopPermitsEverythingButTheStateMachine(t *testing.T) {
 	nop := NewNop()
 	task := &workflow.Task{State: workflow.StatePlanning, Receipts: map[string]workflow.Receipt{}}
 	sess := &Session{}
 
-	if got := nop.VisibleTools(task, sess, allTools()); len(got) != len(allTools()) {
-		t.Errorf("every tool should stay visible, got %d of %d", len(got), len(allTools()))
+	visible := nop.VisibleTools(task, sess, allTools())
+	for _, def := range visible {
+		if IsWorkflowTool(def.Name) {
+			t.Errorf("%s should not be offered to an ungoverned session", def.Name)
+		}
 	}
+	// Everything that is not the state machine survives untouched.
+	var wantVisible int
+	for _, def := range allTools() {
+		if !IsWorkflowTool(def.Name) {
+			wantVisible++
+		}
+	}
+	if len(visible) != wantVisible {
+		t.Errorf("visible tools = %d, want %d", len(visible), wantVisible)
+	}
+	if wantVisible == len(allTools()) {
+		t.Fatal("the fixture has no workflow tools, so this proves nothing")
+	}
+
 	if tc := nop.ToolChoice(task, sess); tc != nil {
 		t.Error("the model must not be constrained")
 	}
@@ -47,6 +67,41 @@ func TestNopIsFullyPermissive(t *testing.T) {
 	}
 	if nop.Enabled() {
 		t.Error("Enabled() should report ungoverned")
+	}
+}
+
+// Masking hides the workflow tools, so a call for one means the model asked
+// anyway — usually by repeating a call from before governance was switched
+// off, which is still in its context.
+func TestNopRefusesWorkflowCalls(t *testing.T) {
+	nop := NewNop()
+	task := &workflow.Task{State: workflow.StatePlanning, Receipts: map[string]workflow.Receipt{}}
+
+	for _, name := range []string{
+		ToolSubmitPlan, ToolSubmitImplementation, ToolSubmitQA,
+		ToolComplete, ToolStatus, ToolHistory, ToolBlock,
+		"workflow_start", "workflow_anything_later",
+	} {
+		d := nop.Intercept(task, &Session{}, provider.ToolCall{Name: name})
+		if d.Allow {
+			t.Errorf("%s advanced the state machine in an ungoverned session", name)
+		}
+		if d.Reason == "" || d.Correction == "" {
+			t.Errorf("%s: refusal must say why and what to do instead: %+v", name, d)
+		}
+	}
+}
+
+func TestIsWorkflowTool(t *testing.T) {
+	for _, name := range []string{ToolSubmitPlan, ToolStatus, "workflow_"} {
+		if !IsWorkflowTool(name) {
+			t.Errorf("%q should be recognised as a workflow tool", name)
+		}
+	}
+	for _, name := range []string{ToolRead, ToolEdit, ToolBash, ToolTask, "", "my_workflow_tool"} {
+		if IsWorkflowTool(name) {
+			t.Errorf("%q should not be recognised as a workflow tool", name)
+		}
 	}
 }
 

@@ -1,9 +1,23 @@
 package enforce
 
 import (
+	"strings"
+
 	"github.com/lmurphy/agentwarden/internal/provider"
 	"github.com/lmurphy/agentwarden/internal/workflow"
 )
+
+// WorkflowToolPrefix marks the tools that drive the state machine. They are
+// recognised by prefix rather than by an explicit list, so a policy or a
+// future tool cannot escape the check by being added in one place and
+// forgotten in another — the failure the plugin had, where delegation was
+// suppressed by deleting two hardcoded key names.
+const WorkflowToolPrefix = "workflow_"
+
+// IsWorkflowTool reports whether a tool name belongs to the state machine.
+func IsWorkflowTool(name string) bool {
+	return strings.HasPrefix(name, WorkflowToolPrefix)
+}
 
 // Governor is the seam the agent loop talks to. Both the real Enforcer and the
 // no-op implementation satisfy it, so the loop has one code path whether or
@@ -36,16 +50,45 @@ type Nop struct{}
 // NewNop returns the ungoverned Governor.
 func NewNop() Nop { return Nop{} }
 
-// VisibleTools returns every tool unchanged.
+// VisibleTools returns every tool except the ones that drive the state
+// machine.
+//
+// Those are withheld for two reasons. They would be live: the workflow tools
+// mutate stored task state through the controller, so an ungoverned session
+// could submit a plan or complete a task with nothing checking gates —
+// governance would be off while its state advanced. And their mere presence
+// misleads: a model handed workflow_start and workflow_status infers it is in
+// a governed workflow and narrates one, which is exactly what plain mode is
+// for avoiding.
 func (Nop) VisibleTools(_ *workflow.Task, _ *Session, all []provider.ToolDef) []provider.ToolDef {
-	return all
+	out := make([]provider.ToolDef, 0, len(all))
+	for _, def := range all {
+		if IsWorkflowTool(def.Name) {
+			continue
+		}
+		out = append(out, def)
+	}
+	return out
 }
 
 // ToolChoice never constrains the model.
 func (Nop) ToolChoice(*workflow.Task, *Session) *provider.ToolChoice { return nil }
 
-// Intercept allows every call.
-func (Nop) Intercept(*workflow.Task, *Session, provider.ToolCall) Decision { return allow() }
+// Intercept allows every call except one into the state machine.
+//
+// Masking already hides those tools, so reaching here means the model asked
+// for one anyway — most often by repeating a call it made before governance
+// was switched off, which is still in its context.
+func (Nop) Intercept(_ *workflow.Task, _ *Session, call provider.ToolCall) Decision {
+	if IsWorkflowTool(call.Name) {
+		return Decision{
+			Reason: call.Name + " is unavailable: this session is not governed",
+			Correction: "There is no workflow in this session. " + call.Name +
+				" does not apply; carry out the request directly with the tools you have.",
+		}
+	}
+	return allow()
+}
 
 // OnTurnEnd allows the turn to end.
 func (Nop) OnTurnEnd(*workflow.Task, *Session, []string) Decision { return allow() }

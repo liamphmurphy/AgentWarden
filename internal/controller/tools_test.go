@@ -21,7 +21,7 @@ type toolHarness struct {
 func newToolHarness(t *testing.T) *toolHarness {
 	t.Helper()
 	h := newHarness(t, policyDoc)
-	task, err := h.ctl.Start("fix the thing")
+	task, err := h.ctl.Start(context.Background(), "fix the thing")
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -29,6 +29,15 @@ func newToolHarness(t *testing.T) *toolHarness {
 	registry := tool.NewRegistry()
 	Register(registry, h.ctl, actor)
 	return &toolHarness{harness: h, registry: registry, actor: actor, taskID: task.ID}
+}
+
+// editTree simulates the implementing stage actually writing something, which
+// the baseline check requires before an implementation can be submitted.
+func (h *toolHarness) editTree() {
+	h.finger.current = workflow.Fingerprint{
+		Head:   h.finger.current.Head,
+		Digest: h.finger.current.Digest + "+",
+	}
 }
 
 // call invokes a registered tool by name.
@@ -150,6 +159,7 @@ func TestSubmitImplementationTool(t *testing.T) {
 	h := newToolHarness(t)
 	h.call(t, enforce.ToolSubmitPlan, `{"plan":"p","acceptance_criteria":["x"]}`)
 	h.actor.AgentID = "engineer"
+	h.editTree()
 
 	result := h.call(t, enforce.ToolSubmitImplementation,
 		`{"summary":"changed the operator","files_changed":["add.go"]}`)
@@ -182,7 +192,8 @@ func TestSubmitQAToolRecordsVerdict(t *testing.T) {
 	h := newToolHarness(t)
 	h.call(t, enforce.ToolSubmitPlan, `{"plan":"p","acceptance_criteria":["x"]}`)
 	h.actor.AgentID = "engineer"
-	h.call(t, enforce.ToolSubmitImplementation, `{"summary":"done"}`)
+	h.editTree()
+	h.call(t, enforce.ToolSubmitImplementation, `{"summary":"done","files_changed":["add.go"]}`)
 	if outcome := h.ctl.Verify(context.Background(), h.taskID); outcome.Error != nil {
 		t.Fatalf("Verify: %v", outcome.Error)
 	}
@@ -227,7 +238,8 @@ func TestCompleteToolSucceedsWithEvidence(t *testing.T) {
 	h := newToolHarness(t)
 	h.call(t, enforce.ToolSubmitPlan, `{"plan":"p","acceptance_criteria":["x"]}`)
 	h.actor.AgentID = "engineer"
-	h.call(t, enforce.ToolSubmitImplementation, `{"summary":"done"}`)
+	h.editTree()
+	h.call(t, enforce.ToolSubmitImplementation, `{"summary":"done","files_changed":["add.go"]}`)
 	h.ctl.Verify(context.Background(), h.taskID)
 	h.actor.AgentID = "qa-engineer"
 	h.call(t, enforce.ToolSubmitQA, `{"verdict":"approved","notes":"ok"}`)
