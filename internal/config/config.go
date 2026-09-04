@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -334,7 +335,10 @@ func (c *Config) ResolveModel(ref string) (providerID string, model Model, err e
 	return providerID, m, nil
 }
 
-// ModelRefs lists every configured provider/model pair, for the model picker.
+// ModelRefs lists every configured provider/model pair, sorted.
+//
+// The order is stable because this drives the model picker: map iteration
+// order would reshuffle the list between runs.
 func (c *Config) ModelRefs() []string {
 	var out []string
 	for id, p := range c.Providers {
@@ -342,7 +346,25 @@ func (c *Config) ModelRefs() []string {
 			out = append(out, id+"/"+modelID)
 		}
 	}
+	sort.Strings(out)
 	return out
+}
+
+// DescribeModel renders a provider/model reference for display, preferring the
+// configured labels over the raw identifiers.
+func (c *Config) DescribeModel(ref string) string {
+	providerID, model, err := c.ResolveModel(ref)
+	if err != nil {
+		return ref
+	}
+	providerName := c.Providers[providerID].Name
+	if providerName == "" {
+		providerName = providerID
+	}
+	if model.Name == "" || model.Name == model.ModelID {
+		return providerName
+	}
+	return providerName + " — " + model.Name
 }
 
 // PolicyPath returns the resolved policy path.

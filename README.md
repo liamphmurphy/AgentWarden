@@ -405,16 +405,61 @@ agentwarden run "quick question"   # one-shot, for scripting
 "ask" to "allow" but **never overrides an explicit `deny` rule** — a rule you
 wrote outranks a convenience flag. Toggle it in-session with `/auto`.
 
+## Switching provider and model
+
+`ctrl+p` opens a picker listing every provider/model pair in your config:
+
+```
+┌ Switch model   ↑↓ select · enter confirm · esc cancel ─────────────────────┐
+│   ollama/gemma4:latest        Ollama — Gemma 4 (8B)                        │
+│ › ollama/qwen3.5:latest       Ollama — Qwen 3.5 (9.7B)                     │
+│   ollama/qwen3.8:27b-mlx      Ollama — Qwen 3.8 (27B MLX)                  │
+│   gateway/sonnet              Gateway — Claude Sonnet                      │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+The cursor starts on the model you are already using, so confirming by accident
+changes nothing. `esc` cancels.
+
+| | |
+|---|---|
+| **`ctrl+p`** | Open the model picker |
+| `/model` | The same picker, as a command |
+| `/model gateway/sonnet` | Switch directly, skipping the picker |
+| `-model gateway/sonnet` | Choose the model at startup |
+
+This rebuilds the provider client and swaps it onto the running agent loop, so
+the next request genuinely goes to the new endpoint. From a request log across
+one switch:
+
+```
+request 0: provider=ollama         model=qwen3.5:latest
+request 1: provider=rp-switchyard  model=sonnet
+```
+
+**The conversation is kept.** Switching mid-task is most useful for escalating
+a problem the current model is struggling with — drop from a gateway to a local
+model for cheap iteration, or climb the other way when a 9B model stalls.
+
+The picker is only offered when there is more than one model configured; the
+`ctrl+p` hint disappears otherwise rather than opening a one-item list. A
+switch is refused mid-turn, as with mode; cancel with `ctrl+c` first.
+
+Models must be declared in config to be selectable — except on a provider that
+declares none at all, which accepts any name, since a local endpoint often
+serves whatever has been pulled.
+
 ## Keys and commands
 
 | Key | Action |
 |---|---|
 | `ctrl+g` | Toggle governed / plain |
+| `ctrl+p` | Switch provider / model |
 | `ctrl+w` | Toggle the gate pane |
 | `ctrl+c` | Cancel the running turn (or quit when idle) |
 | `ctrl+d` | Quit |
 
-`/help` · `/mode` · `/govern` · `/plain` · `/auto` · `/gates` · `/clear` · `/quit`
+`/help` · `/model` · `/mode` · `/govern` · `/plain` · `/auto` · `/gates` · `/clear` · `/quit`
 
 ## Verifying it actually works
 

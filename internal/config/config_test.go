@@ -462,3 +462,55 @@ func TestMissingEnvFileIsAnError(t *testing.T) {
 		t.Error("a configured but absent envFile should be an error, not silence")
 	}
 }
+
+// TestModelRefsAreSorted matters because this list drives the model picker:
+// map iteration order would reshuffle it between runs.
+func TestModelRefsAreSorted(t *testing.T) {
+	cfg := &Config{Providers: map[string]Provider{
+		"zebra": {BaseURL: "x", Models: map[string]Model{"m2": {}, "m1": {}}},
+		"alpha": {BaseURL: "x", Models: map[string]Model{"b": {}, "a": {}}},
+	}}
+
+	want := []string{"alpha/a", "alpha/b", "zebra/m1", "zebra/m2"}
+	for range 5 { // repeat: an unsorted implementation would pass intermittently
+		got := cfg.ModelRefs()
+		if len(got) != len(want) {
+			t.Fatalf("ModelRefs() = %v, want %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("ModelRefs() = %v, want %v", got, want)
+			}
+		}
+	}
+}
+
+func TestDescribeModel(t *testing.T) {
+	cfg := &Config{Providers: map[string]Provider{
+		"ollama": {Name: "Ollama", BaseURL: "x", Models: map[string]Model{
+			"qwen3.5:latest": {Name: "Qwen 3.5 (9.7B)"},
+			"plain":          {},
+		}},
+		"bare": {BaseURL: "x", Models: map[string]Model{"m": {}}},
+	}}
+
+	tests := []struct {
+		ref  string
+		want string
+	}{
+		{"ollama/qwen3.5:latest", "Ollama — Qwen 3.5 (9.7B)"},
+		// No distinct label: the provider name alone is enough, since the
+		// reference is already shown alongside.
+		{"ollama/plain", "Ollama"},
+		{"bare/m", "bare"},
+		// Unresolvable references fall back to the raw string rather than
+		// rendering an empty row.
+		{"nope/nope", "nope/nope"},
+		{"malformed", "malformed"},
+	}
+	for _, tc := range tests {
+		if got := cfg.DescribeModel(tc.ref); got != tc.want {
+			t.Errorf("DescribeModel(%q) = %q, want %q", tc.ref, got, tc.want)
+		}
+	}
+}

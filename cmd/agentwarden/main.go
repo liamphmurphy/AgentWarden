@@ -309,19 +309,7 @@ func build(opts options, oneShot bool) (*app, error) {
 		a.logFile = f
 	}
 
-	p := cfg.Providers[providerID]
-	clientOpts := openaicompat.Options{
-		ID:      providerID,
-		Name:    p.Name,
-		BaseURL: p.BaseURL,
-		APIKey:  p.APIKey,
-		Headers: p.Headers,
-		Extra:   p.Extra,
-	}
-	if a.logFile != nil {
-		clientOpts.Logger = &requestLogger{file: a.logFile}
-	}
-	a.provider = openaicompat.New(clientOpts)
+	a.provider = a.newProviderClient(providerID)
 
 	// Whether governance *starts* on. Availability is decided separately,
 	// below, by whether a policy loads: the session can be switched either
@@ -435,6 +423,56 @@ func (a *app) syncActor() {
 	if a.agentDef != nil {
 		a.actor.AgentID = a.agentDef.Name
 	}
+}
+
+// newProviderClient builds the HTTP client for a configured provider. It is a
+// method so a mid-session model switch can rebuild it with the same options,
+// including the request log.
+func (a *app) newProviderClient(providerID string) provider.Provider {
+	p := a.cfg.Providers[providerID]
+	opts := openaicompat.Options{
+		ID:      providerID,
+		Name:    p.Name,
+		BaseURL: p.BaseURL,
+		APIKey:  p.APIKey,
+		Headers: p.Headers,
+		Extra:   p.Extra,
+	}
+	if a.logFile != nil {
+		opts.Logger = &requestLogger{file: a.logFile}
+	}
+	return openaicompat.New(opts)
+}
+
+// ModelRefs lists the selectable provider/model references.
+func (a *app) ModelRefs() []string { return a.cfg.ModelRefs() }
+
+// DescribeModel renders a reference for display.
+func (a *app) DescribeModel(ref string) string { return a.cfg.DescribeModel(ref) }
+
+// CurrentModel returns the active reference.
+func (a *app) CurrentModel() string { return a.modelRef }
+
+// SetModel switches the live session to another provider and model.
+//
+// The client is rebuilt and swapped onto the loop, so the change takes effect
+// on the next request rather than only relabelling the status bar. The
+// conversation is deliberately kept: switching model mid-task is most useful
+// for escalating a problem the current model is struggling with.
+func (a *app) SetModel(ref string) error {
+	if a.loop == nil {
+		return errors.New("no active session")
+	}
+	providerID, model, err := a.cfg.ResolveModel(ref)
+	if err != nil {
+		return err
+	}
+	a.provider = a.newProviderClient(providerID)
+	a.modelRef = ref
+	a.modelID = model.ModelID
+	a.loop.Provider = a.provider
+	a.loop.Model = a.modelID
+	return nil
 }
 
 // registerCoreTools adds the filesystem, search and shell tools.
@@ -672,6 +710,7 @@ func (a *app) runTUI() error {
 	model := tui.New(tui.Options{
 		GlamourStyle: glamourStyle,
 		Switcher:     a,
+		Models:       a,
 		Gates:        gates,
 		Governed:     a.governed,
 		Auto:         a.cfg.Auto,

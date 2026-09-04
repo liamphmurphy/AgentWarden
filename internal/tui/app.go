@@ -58,6 +58,22 @@ type Runner interface {
 	Run(ctx context.Context, prompt string) (agent.Result, error)
 }
 
+// ModelSwitcher changes the provider and model on a live session.
+//
+// Like ModeSwitcher, this cannot be done from the TUI alone: the provider
+// client lives on the agent loop, so a label change would leave requests going
+// to the old endpoint.
+type ModelSwitcher interface {
+	// ModelRefs lists the selectable provider/model references.
+	ModelRefs() []string
+	// DescribeModel renders a reference for display.
+	DescribeModel(ref string) string
+	// CurrentModel returns the active reference.
+	CurrentModel() string
+	// SetModel switches the session to a reference.
+	SetModel(ref string) error
+}
+
 // ModeSwitcher swaps governance on and off for a live session.
 //
 // The TUI cannot do this itself: enforcement lives in the agent loop's
@@ -78,6 +94,8 @@ type ModeSwitcher interface {
 type Model struct {
 	runner   Runner
 	switcher ModeSwitcher
+	models   ModelSwitcher
+	picker   *Picker
 	events   chan tea.Msg
 
 	viewport viewport.Model
@@ -125,6 +143,7 @@ type Model struct {
 type Options struct {
 	Runner    Runner
 	Switcher  ModeSwitcher
+	Models    ModelSwitcher
 	Gates     []workflow.Gate
 	Governed  bool
 	Auto      bool
@@ -162,6 +181,8 @@ func New(opts Options) *Model {
 	return &Model{
 		glamourStyle: style,
 		switcher:     opts.Switcher,
+		models:       opts.Models,
+		picker:       NewPicker(8),
 		runner:       opts.Runner,
 		events:       make(chan tea.Msg, 256),
 		viewport:     viewport.New(80, 20),
@@ -179,6 +200,51 @@ func New(opts Options) *Model {
 // SetSwitcher attaches the governance switcher, for the same reason SetRunner
 // exists: the app is built after the model.
 func (m *Model) SetSwitcher(s ModeSwitcher) { m.switcher = s }
+
+// SetModels attaches the model switcher.
+func (m *Model) SetModels(s ModelSwitcher) { m.models = s }
+
+// openModelPicker shows the list of configured provider/model references.
+func (m *Model) openModelPicker() {
+	if m.models == nil {
+		m.note(styleFail, "this session cannot switch model")
+		return
+	}
+	refs := m.models.ModelRefs()
+	if len(refs) == 0 {
+		m.note(styleFail, "no models are configured; add one under \"providers\" in your config")
+		return
+	}
+	if len(refs) == 1 {
+		m.note(styleMuted, "only one model is configured: "+refs[0])
+		return
+	}
+
+	choices := make([]Choice, 0, len(refs))
+	for _, ref := range refs {
+		choices = append(choices, Choice{Value: ref, Label: m.models.DescribeModel(ref)})
+	}
+	m.picker.Open("Switch model", choices, m.models.CurrentModel())
+	m.resize(m.width, m.height)
+}
+
+// applyModel switches the session to a reference and reports the outcome.
+func (m *Model) applyModel(ref string) {
+	if m.models == nil {
+		m.note(styleFail, "this session cannot switch model")
+		return
+	}
+	if ref == m.models.CurrentModel() {
+		m.note(styleMuted, "already using "+ref)
+		return
+	}
+	if err := m.models.SetModel(ref); err != nil {
+		m.note(styleFail, "could not switch model: "+err.Error())
+		return
+	}
+	m.ModelName = ref
+	m.note(styleOK, "model: "+ref)
+}
 
 // canSwitch reports whether governance can be toggled in this session.
 func (m *Model) canSwitch() bool {
@@ -363,6 +429,40 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // handleKey processes key input.
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// While a picker is open it owns navigation and confirmation, so it is
+	// checked before the normal bindings; otherwise "enter" would submit a
+	// prompt instead of selecting a row.
+	if m.picker.IsOpen() {
+		switch msg.String() {
+		case "up", "ctrl+p", "k":
+			m.picker.Move(-1)
+			return m, nil
+		case "down", "ctrl+n", "j":
+			m.picker.Move(1)
+			return m, nil
+		case "pgup":
+			m.picker.Move(-5)
+			return m, nil
+		case "pgdown":
+			m.picker.Move(5)
+			return m, nil
+		case "enter", "tab":
+			if choice, ok := m.picker.Selected(); ok {
+				m.picker.Close()
+				m.applyModel(choice.Value)
+			} else {
+				m.picker.Close()
+			}
+			m.resize(m.width, m.height)
+			return m, nil
+		case "esc", "ctrl+c", "q":
+			m.picker.Close()
+			m.resize(m.width, m.height)
+			return m, nil
+		}
+		return m, nil
+	}
+
 	switch msg.String() {
 	case "ctrl+c":
 		// While busy, cancel the run rather than quitting, so a long gate
@@ -385,6 +485,14 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Toggle governance. The hint in the status bar names whichever
 		// direction this will go.
 		m.setGoverned(!m.Governed)
+		return m, nil
+
+	case "ctrl+p":
+		if m.busy {
+			m.note(styleWarn, "finish or cancel the current turn before switching model")
+			return m, nil
+		}
+		m.openModelPicker()
 		return m, nil
 
 	case "enter":
@@ -416,6 +524,7 @@ func (m *Model) command(input string) (bool, tea.Cmd) {
 	case "/help":
 		m.transcript = append(m.transcript, stylePane.Render(strings.Join([]string{
 			styleAccent.Render("Commands"),
+			"/model    switch provider / model            (ctrl+p)",
 			"/mode     toggle governed / plain            (ctrl+g)",
 			"/govern   enforce the workflow: gates and stages",
 			"/plain    drop governance, for quick questions",
@@ -430,6 +539,13 @@ func (m *Model) command(input string) (bool, tea.Cmd) {
 		m.setGoverned(true)
 	case "/mode":
 		m.setGoverned(!m.Governed)
+	case "/model", "/provider":
+		// With an argument, switch directly; without one, offer the list.
+		if fields := strings.Fields(input); len(fields) > 1 {
+			m.applyModel(fields[1])
+		} else {
+			m.openModelPicker()
+		}
 	case "/auto":
 		m.Auto = !m.Auto
 		m.transcript = append(m.transcript,
@@ -485,8 +601,9 @@ func (m *Model) resize(width, height int) {
 	if m.showGates {
 		gateHeight = lipglossHeight(m.gates.View(m.tick))
 	}
-	// Reserve rows for the input, the status bar and the gate pane.
-	chrome := m.input.Height() + 2 + 1 + gateHeight
+	pickerHeight := lipglossHeight(m.picker.View(width))
+	// Reserve rows for the input, the status bar, the gate pane and the picker.
+	chrome := m.input.Height() + 2 + 1 + gateHeight + pickerHeight
 	viewportHeight := height - chrome
 	if viewportHeight < 3 {
 		viewportHeight = 3
@@ -534,6 +651,11 @@ func (m *Model) View() string {
 	var b strings.Builder
 	b.WriteString(m.viewport.View())
 	b.WriteString("\n")
+
+	if pane := m.picker.View(m.width); pane != "" {
+		b.WriteString(pane)
+		b.WriteString("\n")
+	}
 
 	if m.showGates {
 		if pane := m.gates.View(m.tick); pane != "" {
@@ -604,6 +726,9 @@ func (m *Model) hints() []string {
 		} else {
 			out = append(out, "ctrl+g govern")
 		}
+	}
+	if m.models != nil && len(m.models.ModelRefs()) > 1 {
+		out = append(out, "ctrl+p model")
 	}
 	if m.Governed {
 		out = append(out, "ctrl+w gates")

@@ -95,21 +95,27 @@ editing a test to make a change pass, stop and reconsider the change.
 9. **`--auto` never overrides an explicit `deny`.** It upgrades `ask` to
    `allow` and nothing else.
 
-10. **A mode switch must swap the loop's governor, never just a label.**
-    `tui.Model.Governed` decides only what the status bar says; enforcement
-    lives in `agent.Loop.Governor`. `/plain` originally flipped the flag alone
-    and printed "workflow enforcement off" while the enforcer stayed fully
-    active. Anything that changes mode goes through `ModeSwitcher`, and the UI
-    only updates its label after the switcher returns without error. See
-    `TestSwitchDelegatesRatherThanRelabelling`.
+10. **A live switch must change the thing, never just the label.** This
+    applies to both switchers. `tui.Model.Governed` and `tui.Model.ModelName`
+    only decide what the status bar says; enforcement lives in
+    `agent.Loop.Governor` and the endpoint in `agent.Loop.Provider`. Changes go
+    through `ModeSwitcher` / `ModelSwitcher`, and the UI updates its label only
+    after the switcher returns without error. See
+    `TestSwitchDelegatesRatherThanRelabelling` and
+    `TestFailedModelSwitchDoesNotRelabel`.
 
-11. **Terminal capability detection happens before the program starts.**
+11. **An open picker owns the keyboard.** `handleKey` checks
+    `picker.IsOpen()` before the normal bindings, so `enter` selects a row
+    rather than submitting the half-typed prompt behind the overlay.
+    See `TestPickerOwnsEnterWhileOpen`.
+
+12. **Terminal capability detection happens before the program starts.**
     Querying the background colour writes an escape sequence and reads the
     reply; once Bubble Tea owns stdin, that reply is read as keystrokes and
     appears as junk in the prompt. `tui.DetectTheme` is the only place allowed
     to do it, enforced by an AST check in `TestNoTerminalQueryingAPIsInModel`.
 
-12. **Filesystem tools stay confined to the project root.** `tool.resolve`
+13. **Filesystem tools stay confined to the project root.** `tool.resolve`
     handles the awkward cases (a file that does not exist yet, a symlinked
     root such as macOS `/tmp` → `/private/tmp`). Don't simplify it back into a
     prefix comparison.

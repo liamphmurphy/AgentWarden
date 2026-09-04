@@ -943,3 +943,271 @@ func TestGatePaneFollowsMode(t *testing.T) {
 		t.Error("re-engaging should bring it back")
 	}
 }
+
+// fakeModels records real model switches, standing in for the app.
+type fakeModels struct {
+	refs    []string
+	current string
+	calls   []string
+	err     error
+}
+
+func (f *fakeModels) ModelRefs() []string { return f.refs }
+
+func (f *fakeModels) DescribeModel(ref string) string { return "desc:" + ref }
+
+func (f *fakeModels) CurrentModel() string { return f.current }
+
+func (f *fakeModels) SetModel(ref string) error {
+	f.calls = append(f.calls, ref)
+	if f.err != nil {
+		return f.err
+	}
+	f.current = ref
+	return nil
+}
+
+func newPickableModel(t *testing.T, refs ...string) (*Model, *fakeModels) {
+	t.Helper()
+	if len(refs) == 0 {
+		refs = []string{"ollama/qwen3.5", "gw/sonnet", "gw/nemotron"}
+	}
+	fm := &fakeModels{refs: refs, current: refs[0]}
+	m := New(Options{
+		Runner:    &stubRunner{},
+		Switcher:  &fakeSwitcher{available: true, governed: true, state: workflow.StatePlanning},
+		Models:    fm,
+		Gates:     testGates(),
+		Governed:  true,
+		ModelName: refs[0],
+	})
+	m.resize(120, 30)
+	return m, fm
+}
+
+// TestCtrlPOpensModelPicker is the shortcut the status bar advertises.
+func TestCtrlPOpensModelPicker(t *testing.T) {
+	m, fm := newPickableModel(t)
+
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+	if !m.picker.IsOpen() {
+		t.Fatal("ctrl+p should open the model picker")
+	}
+	if m.picker.Len() != len(fm.refs) {
+		t.Errorf("picker has %d rows, want %d", m.picker.Len(), len(fm.refs))
+	}
+	// It should start on the model currently in use.
+	if got, _ := m.picker.Selected(); got.Value != fm.current {
+		t.Errorf("picker starts on %q, want the current model %q", got.Value, fm.current)
+	}
+}
+
+// TestPickerSelectionSwitchesModel is the substance: selecting a row must
+// delegate, not just relabel the status bar.
+func TestPickerSelectionSwitchesModel(t *testing.T) {
+	m, fm := newPickableModel(t)
+
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+	m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.picker.IsOpen() {
+		t.Error("confirming should close the picker")
+	}
+	if len(fm.calls) != 1 || fm.calls[0] != "gw/sonnet" {
+		t.Fatalf("the switcher should have been asked for gw/sonnet: %v", fm.calls)
+	}
+	if m.ModelName != "gw/sonnet" {
+		t.Errorf("ModelName = %q, want the new model", m.ModelName)
+	}
+	if !strings.Contains(stripANSI(m.statusBar()), "gw/sonnet") {
+		t.Error("the status bar should show the new model")
+	}
+}
+
+func TestPickerEscapeCancels(t *testing.T) {
+	m, fm := newPickableModel(t)
+
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+	m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	if m.picker.IsOpen() {
+		t.Error("esc should close the picker")
+	}
+	if len(fm.calls) != 0 {
+		t.Errorf("cancelling must not switch: %v", fm.calls)
+	}
+	if m.ModelName != "ollama/qwen3.5" {
+		t.Errorf("ModelName = %q, want it unchanged", m.ModelName)
+	}
+}
+
+// TestPickerOwnsEnterWhileOpen: without this, enter would submit a prompt
+// instead of selecting a row.
+func TestPickerOwnsEnterWhileOpen(t *testing.T) {
+	m, _ := newPickableModel(t)
+	m.input.SetValue("a prompt I am typing")
+
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.busy {
+		t.Error("enter should have selected a row, not submitted the prompt")
+	}
+	if m.input.Value() != "a prompt I am typing" {
+		t.Errorf("the typed prompt should survive, got %q", m.input.Value())
+	}
+}
+
+// TestPickerSwallowsTypingWhileOpen: keys must not leak into the input box
+// behind the overlay.
+func TestPickerSwallowsTypingWhileOpen(t *testing.T) {
+	m, _ := newPickableModel(t)
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	if strings.Contains(m.input.Value(), "x") {
+		t.Errorf("typing should not reach the input while picking, got %q", m.input.Value())
+	}
+}
+
+func TestFailedModelSwitchDoesNotRelabel(t *testing.T) {
+	m, fm := newPickableModel(t)
+	fm.err = errors.New("unknown provider \"gw\"")
+
+	m.applyModel("gw/sonnet")
+	if m.ModelName != "ollama/qwen3.5" {
+		t.Error("a refused switch must leave the label unchanged")
+	}
+	if !strings.Contains(strings.Join(m.transcript, "\n"), "unknown provider") {
+		t.Errorf("the reason should be surfaced: %v", m.transcript)
+	}
+}
+
+func TestSwitchingToCurrentModelIsNoted(t *testing.T) {
+	m, fm := newPickableModel(t)
+	m.applyModel("ollama/qwen3.5")
+	if len(fm.calls) != 0 {
+		t.Error("switching to the current model should be a no-op")
+	}
+	if !strings.Contains(strings.Join(m.transcript, "\n"), "already using") {
+		t.Errorf("the user should be told: %v", m.transcript)
+	}
+}
+
+func TestModelCommandWithArgumentSwitchesDirectly(t *testing.T) {
+	for _, cmd := range []string{"/model gw/sonnet", "/provider gw/sonnet"} {
+		t.Run(cmd, func(t *testing.T) {
+			m, fm := newPickableModel(t)
+			m.command(cmd)
+			if len(fm.calls) != 1 || fm.calls[0] != "gw/sonnet" {
+				t.Errorf("%s should switch directly: %v", cmd, fm.calls)
+			}
+			if m.picker.IsOpen() {
+				t.Error("an explicit argument should not open the picker")
+			}
+		})
+	}
+}
+
+func TestBareModelCommandOpensPicker(t *testing.T) {
+	m, fm := newPickableModel(t)
+	m.command("/model")
+	if !m.picker.IsOpen() {
+		t.Error("/model with no argument should offer the list")
+	}
+	if len(fm.calls) != 0 {
+		t.Error("opening the list should not switch anything")
+	}
+}
+
+// TestSingleModelNeedsNoPicker: offering a one-item list is just noise.
+func TestSingleModelNeedsNoPicker(t *testing.T) {
+	m, _ := newPickableModel(t, "ollama/qwen3.5")
+	m.openModelPicker()
+	if m.picker.IsOpen() {
+		t.Error("a single configured model should not open a picker")
+	}
+	if !strings.Contains(strings.Join(m.transcript, "\n"), "only one model") {
+		t.Errorf("the user should be told why: %v", m.transcript)
+	}
+}
+
+func TestNoModelsConfiguredIsExplained(t *testing.T) {
+	fm := &fakeModels{}
+	m := New(Options{Runner: &stubRunner{}, Models: fm})
+	m.resize(120, 30)
+
+	m.openModelPicker()
+	if m.picker.IsOpen() {
+		t.Error("nothing to pick")
+	}
+	if !strings.Contains(strings.Join(m.transcript, "\n"), "no models are configured") {
+		t.Errorf("the user should be told: %v", m.transcript)
+	}
+}
+
+func TestModelSwitchRefusedWhileBusy(t *testing.T) {
+	m, fm := newPickableModel(t)
+	m.busy = true
+
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+	if m.picker.IsOpen() {
+		t.Error("the model must not change mid-turn")
+	}
+	if len(fm.calls) != 0 {
+		t.Error("nothing should have been switched")
+	}
+	if !strings.Contains(strings.Join(m.transcript, "\n"), "cancel the current turn") {
+		t.Errorf("the user should be told why: %v", m.transcript)
+	}
+}
+
+// TestModelHintShownOnlyWhenUseful: never advertise a key that opens a
+// one-item list.
+func TestModelHintShownOnlyWhenUseful(t *testing.T) {
+	many, _ := newPickableModel(t)
+	if !strings.Contains(stripANSI(strings.Join(many.hints(), " ")), "ctrl+p model") {
+		t.Errorf("several models should advertise the shortcut: %v", many.hints())
+	}
+
+	one, _ := newPickableModel(t, "ollama/qwen3.5")
+	if strings.Contains(stripANSI(strings.Join(one.hints(), " ")), "ctrl+p") {
+		t.Errorf("a single model should not advertise it: %v", one.hints())
+	}
+}
+
+func TestHelpAdvertisesModelSwitch(t *testing.T) {
+	m, _ := newPickableModel(t)
+	m.command("/help")
+	help := stripANSI(strings.Join(m.transcript, "\n"))
+	for _, want := range []string{"ctrl+p", "/model"} {
+		if !strings.Contains(help, want) {
+			t.Errorf("/help should mention %q:\n%s", want, help)
+		}
+	}
+}
+
+func TestPickerIsRenderedInTheFrame(t *testing.T) {
+	m, _ := newPickableModel(t)
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "Switch model") {
+		t.Errorf("the open picker should appear in the frame:\n%s", view)
+	}
+	// It must not crowd out the input box.
+	if !strings.Contains(view, "Ask anything") {
+		t.Errorf("the input should still be visible:\n%s", view)
+	}
+}
+
+func TestModelSwitchWithoutSwitcherIsRefused(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.models = nil
+	m.applyModel("gw/sonnet")
+	if !strings.Contains(strings.Join(m.transcript, "\n"), "cannot switch model") {
+		t.Errorf("the refusal should be explained: %v", m.transcript)
+	}
+}
