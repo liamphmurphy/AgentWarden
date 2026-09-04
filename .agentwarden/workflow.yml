@@ -1,0 +1,36 @@
+version: 1
+
+workflow:
+  require_plan: true
+  require_independent_qa: true
+  # Stage boundaries are a useful place to look at what happened, so handoffs
+  # are driven manually here.
+  auto_advance: false
+
+# Enabled so local models get tool masking, tool_choice pinning and a
+# re-injected state banner.
+small_model_mode: true
+
+roles:
+  orchestrator: orchestrator
+  planner: tech-lead
+  implementer: engineer
+  reviewer: qa-engineer
+
+gates:
+  # Gates go through make so they inherit GOCACHE from the Makefile; a bare
+  # `go test` would use the default cache, which is not writable under the
+  # sandbox this repo is developed in.
+  #
+  # Deliberately NOT `make check`: that runs `gofmt -w`, which rewrites files
+  # and would trip the worktree_changed check — a gate must verify the tree,
+  # not modify it.
+  - id: unit
+    command: ["make", "test"]
+    required: true
+    timeout_seconds: 900
+
+  - id: vet
+    command: ["make", "vet"]
+    required: false
+    timeout_seconds: 300

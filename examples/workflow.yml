@@ -1,0 +1,36 @@
+# Example workflow policy. Copy to .agentwarden/workflow.yml and edit the gate
+# commands to ones that actually exist in your repository.
+version: 1
+
+workflow:
+  require_plan: true
+  require_independent_qa: true
+  # Drive stage handoffs unattended. Leave off if you want to inspect progress
+  # at each stage boundary.
+  auto_advance: false
+
+# Turns on tool masking, tool_choice pinning and per-turn state banners by
+# default. Worth enabling for anything under ~30B parameters.
+small_model_mode: true
+
+# Role IDs must match agent filenames under agentDirs.
+roles:
+  orchestrator: orchestrator
+  planner: tech-lead
+  implementer: engineer
+  reviewer: qa-engineer
+
+gates:
+  # Commands are argv arrays run without a shell: `&&`, pipes and redirects are
+  # inert. For real shell syntax use ["sh", "-lc", "..."].
+  - id: unit
+    command: ["go", "test", "./..."]
+    required: true
+    timeout_seconds: 900
+    max_output_bytes: 1000000
+
+  # An optional gate runs and reports, but does not block completion.
+  - id: vet
+    command: ["go", "vet", "./..."]
+    required: false
+    timeout_seconds: 300

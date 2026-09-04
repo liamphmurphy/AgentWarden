@@ -1,0 +1,945 @@
+package tui
+
+import (
+	"context"
+	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/lmurphy/agentwarden/internal/agent"
+	"github.com/lmurphy/agentwarden/internal/enforce"
+	"github.com/lmurphy/agentwarden/internal/tool"
+	"github.com/lmurphy/agentwarden/internal/workflow"
+)
+
+// stubRunner returns a canned result, optionally blocking until released.
+type stubRunner struct {
+	result  agent.Result
+	err     error
+	release chan struct{}
+	started chan struct{}
+}
+
+func (r *stubRunner) Run(ctx context.Context, _ string) (agent.Result, error) {
+	if r.started != nil {
+		close(r.started)
+	}
+	if r.release != nil {
+		select {
+		case <-r.release:
+		case <-ctx.Done():
+			return agent.Result{}, ctx.Err()
+		}
+	}
+	return r.result, r.err
+}
+
+func testGates() []workflow.Gate {
+	required := true
+	return []workflow.Gate{
+		{ID: "unit", Command: []string{"go", "test", "./..."}, Required: &required},
+		{ID: "integration", Command: []string{"make", "itest"}, Required: &required},
+	}
+}
+
+func newModel(t *testing.T, runner Runner) *Model {
+	t.Helper()
+	m := New(Options{
+		Runner:    runner,
+		Gates:     testGates(),
+		Governed:  true,
+		ModelName: "ollama/qwen3.5",
+		State:     workflow.StatePlanning,
+	})
+	m.resize(100, 30)
+	return m
+}
+
+// TestTickAdvancesAnimationWhileBusy checks the 30fps ticker drives the frame
+// counter and reschedules itself while something is moving.
+func TestTickAdvancesAnimationWhileBusy(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.busy = true
+
+	before := m.tick
+	updated, cmd := m.Update(tickMsg(time.Now()))
+	if cmd == nil {
+		t.Fatal("a tick should schedule the next frame while busy")
+	}
+	if updated.(*Model).tick != before+1 {
+		t.Errorf("tick = %d, want %d", updated.(*Model).tick, before+1)
+	}
+}
+
+// TestTickerStopsWhenIdle: at 30fps an always-on ticker repaints the whole
+// frame 30 times a second while the user is just reading.
+func TestTickerStopsWhenIdle(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.ticking = true
+
+	_, cmd := m.Update(tickMsg(time.Now()))
+	if cmd != nil {
+		t.Error("an idle model should stop ticking")
+	}
+	if m.ticking {
+		t.Error("the model should record that the ticker stopped")
+	}
+}
+
+// TestRunningGateKeepsTicking: gate progress is animated, so the ticker must
+// survive an idle model as long as a gate is in flight.
+func TestRunningGateKeepsTicking(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.gates.Start("unit")
+
+	if !m.animating() {
+		t.Fatal("a running gate counts as animating")
+	}
+	if _, cmd := m.Update(tickMsg(time.Now())); cmd == nil {
+		t.Error("a running gate should keep the ticker alive")
+	}
+}
+
+// TestGateStartResumesIdleTicker covers a gate beginning after the ticker has
+// already stopped.
+func TestGateStartResumesIdleTicker(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.ticking = false
+
+	if _, cmd := m.Update(gateStartMsg{id: "unit"}); cmd == nil {
+		t.Fatal("a gate start should produce commands")
+	}
+	if !m.ticking {
+		t.Error("a gate start should restart the ticker")
+	}
+}
+
+// TestResumeAnimationDoesNotDoubleUp guards against two tickers running at
+// once, which would double the frame rate.
+func TestResumeAnimationDoesNotDoubleUp(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.busy = true
+	m.ticking = true
+
+	if cmd := m.resumeAnimation(); cmd != nil {
+		t.Error("an already-running ticker should not be restarted")
+	}
+}
+
+func TestFrameRateIsThirty(t *testing.T) {
+	if FrameRate != 30 {
+		t.Errorf("FrameRate = %d, want 30", FrameRate)
+	}
+	// The scheduled interval must match the declared rate.
+	if got := time.Second / FrameRate; got != time.Second/30 {
+		t.Errorf("frame interval = %s", got)
+	}
+}
+
+// TestSpinnerAnimates checks successive frames differ, and that the sequence
+// cycles rather than running off the end.
+func TestSpinnerAnimates(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < len(spinnerFrames)*3; i++ {
+		seen[spinnerFrame(i)] = true
+	}
+	if len(seen) != len(spinnerFrames) {
+		t.Errorf("saw %d distinct frames, want %d", len(seen), len(spinnerFrames))
+	}
+	// It must be stable across a full cycle.
+	period := len(spinnerFrames) * 3
+	if spinnerFrame(0) != spinnerFrame(period) {
+		t.Error("the spinner should cycle")
+	}
+	if spinnerFrame(0) == spinnerFrame(3) {
+		t.Error("the frame should advance within a cycle")
+	}
+}
+
+func TestGatePaneRendersEveryStatus(t *testing.T) {
+	pane := NewGatePane(testGates())
+	fixed := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	pane.now = func() time.Time { return fixed }
+
+	// All pending initially.
+	view := pane.View(0)
+	if !strings.Contains(view, "pending") {
+		t.Errorf("want pending gates:\n%s", view)
+	}
+	if pane.Running() {
+		t.Error("nothing should be running yet")
+	}
+
+	// One running: the spinner and elapsed time appear.
+	pane.Start("unit")
+	if !pane.Running() {
+		t.Error("unit should be running")
+	}
+	pane.now = func() time.Time { return fixed.Add(2500 * time.Millisecond) }
+	view = pane.View(0)
+	if !strings.Contains(view, "2.5s") {
+		t.Errorf("want elapsed time:\n%s", view)
+	}
+
+	// One passed.
+	pane.Finish(workflow.Receipt{GateID: "unit", Success: true, DurationMS: 2400})
+	view = pane.View(0)
+	if !strings.Contains(view, glyphPass) {
+		t.Errorf("want a pass glyph:\n%s", view)
+	}
+	if pane.Running() {
+		t.Error("unit has finished")
+	}
+
+	// One failed, with its reason surfaced so the user can see why.
+	pane.Start("integration")
+	pane.Finish(workflow.Receipt{
+		GateID: "integration", Success: false, FailureReason: "command_failed",
+	})
+	view = pane.View(0)
+	if !strings.Contains(view, glyphFail) || !strings.Contains(view, "command_failed") {
+		t.Errorf("want a failure and its reason:\n%s", view)
+	}
+}
+
+func TestGatePaneShowsRunningOutput(t *testing.T) {
+	pane := NewGatePane(testGates())
+	pane.Start("unit")
+	pane.Output("unit", "  ok   pkg/api  0.4s  ")
+
+	view := pane.View(0)
+	if !strings.Contains(view, "ok   pkg/api") {
+		t.Errorf("want the latest output line:\n%s", view)
+	}
+}
+
+func TestGatePaneReset(t *testing.T) {
+	pane := NewGatePane(testGates())
+	pane.Start("unit")
+	pane.Finish(workflow.Receipt{GateID: "unit", Success: true})
+	pane.Reset()
+
+	view := pane.View(0)
+	if strings.Contains(view, glyphPass) {
+		t.Errorf("reset should clear results:\n%s", view)
+	}
+	if pane.Running() {
+		t.Error("reset should clear running state")
+	}
+}
+
+func TestGatePaneEmpty(t *testing.T) {
+	if got := NewGatePane(nil).View(0); got != "" {
+		t.Errorf("an empty pane should render nothing, got %q", got)
+	}
+}
+
+func TestFormatDuration(t *testing.T) {
+	tests := []struct {
+		d    time.Duration
+		want string
+	}{
+		{500 * time.Millisecond, "0.5s"},
+		{2400 * time.Millisecond, "2.4s"},
+		{59 * time.Second, "59.0s"},
+		{60 * time.Second, "1:00"},
+		{47*time.Second + time.Minute, "1:47"},
+		{10 * time.Minute, "10:00"},
+	}
+	for _, tc := range tests {
+		if got := formatDuration(tc.d); got != tc.want {
+			t.Errorf("formatDuration(%s) = %q, want %q", tc.d, got, tc.want)
+		}
+	}
+}
+
+func TestTruncate(t *testing.T) {
+	tests := []struct {
+		in   string
+		n    int
+		want string
+	}{
+		{"short", 10, "short"},
+		{"exactly-10", 10, "exactly-10"},
+		{"much too long here", 8, "much to…"},
+		{"unicode ünïcödé", 10, "unicode ü…"},
+		{"x", 1, "x"},
+	}
+	for _, tc := range tests {
+		if got := truncate(tc.in, tc.n); got != tc.want {
+			t.Errorf("truncate(%q, %d) = %q, want %q", tc.in, tc.n, got, tc.want)
+		}
+	}
+}
+
+// TestStatusBarReflectsMode is what tells the user whether they are governed.
+func TestStatusBarReflectsMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		mutate   func(m *Model)
+		wantWord string
+	}{
+		{"governed shows state", func(m *Model) {}, "planning"},
+		{"plain is labelled", func(m *Model) { m.Governed = false }, "plain"},
+		{"auto is labelled", func(m *Model) { m.Auto = true }, "auto"},
+		{"model name shown", func(m *Model) {}, "qwen3.5"},
+		{"error surfaced", func(m *Model) { m.err = errors.New("boom") }, "boom"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newModel(t, &stubRunner{})
+			tc.mutate(m)
+			if got := m.statusBar(); !strings.Contains(got, tc.wantWord) {
+				t.Errorf("status bar should mention %q:\n%s", tc.wantWord, got)
+			}
+		})
+	}
+}
+
+func TestBusyStatusShowsSpinner(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.busy = true
+	if got := m.statusBar(); !strings.Contains(got, "thinking") {
+		t.Errorf("want a busy indicator:\n%s", got)
+	}
+	m.activeTool = "bash"
+	if got := m.statusBar(); !strings.Contains(got, "bash") {
+		t.Errorf("want the active tool named:\n%s", got)
+	}
+}
+
+// TestPlainCommandNeedsASwitcher: without something able to disengage the
+// enforcer, /plain must refuse rather than relabel the status bar. That
+// mismatch was the original bug.
+func TestPlainCommandNeedsASwitcher(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.switcher = nil
+	if !m.Governed {
+		t.Fatal("precondition: should start governed")
+	}
+
+	handled, _ := m.command("/plain")
+	if !handled {
+		t.Fatal("/plain should be handled as a command")
+	}
+	if !m.Governed {
+		t.Error("/plain must not claim to drop governance it cannot drop")
+	}
+	if !strings.Contains(strings.Join(m.transcript, "\n"), "cannot switch mode") {
+		t.Errorf("the refusal should be explained: %v", m.transcript)
+	}
+}
+
+func TestAutoCommandToggles(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.command("/auto")
+	if !m.Auto {
+		t.Error("/auto should enable auto-approval")
+	}
+	m.command("/auto")
+	if m.Auto {
+		t.Error("/auto should toggle back off")
+	}
+}
+
+func TestCommandsHandled(t *testing.T) {
+	tests := []struct {
+		input       string
+		wantHandled bool
+	}{
+		{"/help", true},
+		{"/plain", true},
+		{"/auto", true},
+		{"/gates", true},
+		{"/clear", true},
+		{"/nonsense", true},
+		{"not a command", false},
+		{"tell me about /help", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			m := newModel(t, &stubRunner{})
+			handled, _ := m.command(tc.input)
+			if handled != tc.wantHandled {
+				t.Errorf("command(%q) handled = %v, want %v", tc.input, handled, tc.wantHandled)
+			}
+		})
+	}
+}
+
+func TestClearCommandEmptiesTranscript(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.transcript = []string{"one", "two"}
+	m.command("/clear")
+	if len(m.transcript) != 0 {
+		t.Errorf("transcript should be cleared, got %v", m.transcript)
+	}
+}
+
+func TestUnknownCommandIsReported(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.command("/definitely-not-real")
+	joined := strings.Join(m.transcript, "\n")
+	if !strings.Contains(joined, "unknown command") {
+		t.Errorf("want an unknown-command message:\n%s", joined)
+	}
+}
+
+func TestCtrlWTogglesGatePane(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	before := m.showGates
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlW})
+	if updated.(*Model).showGates == before {
+		t.Error("ctrl+w should toggle the gate pane")
+	}
+}
+
+// TestCtrlCCancelsRunWhenBusy: interrupting a long gate suite should not lose
+// the session.
+func TestCtrlCCancelsRunWhenBusy(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	cancelled := false
+	m.busy = true
+	m.cancel = func() { cancelled = true }
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	if !cancelled {
+		t.Error("ctrl+c while busy should cancel the run")
+	}
+	if cmd != nil {
+		t.Error("ctrl+c while busy should not quit")
+	}
+}
+
+func TestCtrlCQuitsWhenIdle(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	if cmd == nil {
+		t.Error("ctrl+c while idle should quit")
+	}
+}
+
+func TestBlockedMessageIsSurfaced(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.Update(blockedMsg{reason: "tool \"edit\" is not available in state planning"})
+
+	joined := strings.Join(m.transcript, "\n")
+	if !strings.Contains(joined, "blocked") || !strings.Contains(joined, "not available") {
+		t.Errorf("a block should be visible to the user:\n%s", joined)
+	}
+}
+
+func TestGateMessagesUpdatePane(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.Update(gateStartMsg{id: "unit"})
+	if !m.gates.Running() {
+		t.Error("a gate start should mark the pane running")
+	}
+	m.Update(gateDoneMsg{receipt: workflow.Receipt{GateID: "unit", Success: true, DurationMS: 100}})
+	if m.gates.Running() {
+		t.Error("a receipt should end the running state")
+	}
+	if !strings.Contains(m.gates.View(0), glyphPass) {
+		t.Error("the pane should show the pass")
+	}
+}
+
+func TestTextDeltaAccumulates(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.Update(deltaMsg("Hello"))
+	m.Update(deltaMsg(", world"))
+	if got := m.streaming.String(); got != "Hello, world" {
+		t.Errorf("streaming = %q", got)
+	}
+}
+
+func TestDoneMovesStreamingIntoTranscript(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.busy = true
+	m.Update(deltaMsg("the answer"))
+	m.Update(doneMsg{result: agent.Result{Steps: 1}})
+
+	if m.busy {
+		t.Error("done should clear the busy flag")
+	}
+	if m.streaming.Len() != 0 {
+		t.Error("streaming should be flushed")
+	}
+	if !strings.Contains(stripANSI(strings.Join(m.transcript, "\n")), "the answer") {
+		t.Errorf("the reply should land in the transcript: %v", m.transcript)
+	}
+}
+
+func TestDoneRecordsError(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.busy = true
+	m.Update(doneMsg{err: errors.New("provider unreachable")})
+	if m.err == nil {
+		t.Fatal("the error should be recorded")
+	}
+	if !strings.Contains(m.statusBar(), "provider unreachable") {
+		t.Error("the error should be visible in the status bar")
+	}
+}
+
+func TestToolMessagesRecordOutcome(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.Update(toolMsg{name: "bash"})
+	if m.activeTool != "bash" {
+		t.Errorf("activeTool = %q", m.activeTool)
+	}
+	m.Update(toolMsg{name: "bash", finished: true, isError: true})
+	if m.activeTool != "" {
+		t.Error("a finished tool should clear the active marker")
+	}
+	if !strings.Contains(strings.Join(m.transcript, "\n"), glyphFail) {
+		t.Errorf("a failed tool should be marked:\n%v", m.transcript)
+	}
+}
+
+func TestViewRendersWithoutPanic(t *testing.T) {
+	sizes := [][2]int{{100, 30}, {40, 10}, {200, 60}, {20, 6}}
+	for _, size := range sizes {
+		m := newModel(t, &stubRunner{})
+		m.transcript = []string{"# Heading", "some **markdown**"}
+		m.busy = true
+		m.gates.Start("unit")
+		m.resize(size[0], size[1])
+
+		if view := m.View(); view == "" {
+			t.Errorf("View() empty at %dx%d", size[0], size[1])
+		}
+	}
+}
+
+func TestResizeIgnoresDegenerateSizes(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	width := m.viewport.Width
+	m.resize(0, 0)
+	if m.viewport.Width != width {
+		t.Error("a zero size should be ignored rather than breaking layout")
+	}
+}
+
+func TestObserverDoesNotBlockWhenChannelFull(t *testing.T) {
+	// A one-slot channel that is already full: progress frames must be
+	// dropped rather than stalling the model loop.
+	events := make(chan tea.Msg, 1)
+	events <- deltaMsg("filler")
+	obs := &observer{events: events}
+
+	done := make(chan struct{})
+	go func() {
+		obs.TextDelta("dropped")
+		obs.Blocked(tool.Call{Name: "edit"}, enforce.Decision{Reason: "no"})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("the observer must never block the loop")
+	}
+}
+
+func TestSubmitMarksBusy(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	runner := &stubRunner{started: started, release: release}
+	m := newModel(t, runner)
+
+	cmd := m.submit("do the thing")
+	if !m.busy {
+		t.Error("submit should mark the model busy")
+	}
+	if !strings.Contains(strings.Join(m.transcript, "\n"), "do the thing") {
+		t.Error("the prompt should appear in the transcript")
+	}
+
+	// submit returns a batch (the run plus a ticker restart), so the batch has
+	// to be unwrapped rather than invoked directly.
+	for _, c := range runBatch(t, cmd) {
+		go c()
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the runner should have been invoked")
+	}
+	close(release)
+}
+
+// runBatch unwraps a tea.Batch into its component commands. A batch Cmd
+// returns a BatchMsg rather than doing the work itself.
+func runBatch(t *testing.T, cmd tea.Cmd) []tea.Cmd {
+	t.Helper()
+	if cmd == nil {
+		t.Fatal("expected a command")
+	}
+	switch msg := cmd().(type) {
+	case tea.BatchMsg:
+		return msg
+	default:
+		// Not a batch: hand back a command that replays the message.
+		return []tea.Cmd{func() tea.Msg { return msg }}
+	}
+}
+
+// ansiPattern matches terminal escape sequences.
+var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+
+// stripANSI removes styling so an assertion tests content, not presentation.
+func stripANSI(s string) string { return ansiPattern.ReplaceAllString(s, "") }
+
+var _ tea.Model = (*Model)(nil)
+
+// TestResizeDoesNotChangeGlamourStyle guards a real bug: resize used to
+// rebuild the markdown renderer with glamour.WithAutoStyle(), which queries
+// the terminal for its background colour. Because resize runs on a
+// WindowSizeMsg — after Bubble Tea has taken over stdin — the terminal's reply
+// was read as keyboard input and appeared in the prompt as literal junk
+// (`]11;rgb:0000/0000/0000\[1;1R`).
+func TestResizeDoesNotChangeGlamourStyle(t *testing.T) {
+	m := New(Options{Runner: &stubRunner{}, GlamourStyle: "light"})
+	if m.glamourStyle != "light" {
+		t.Fatalf("glamourStyle = %q, want the style passed in", m.glamourStyle)
+	}
+
+	for _, size := range [][2]int{{100, 30}, {40, 12}, {200, 60}} {
+		m.resize(size[0], size[1])
+		if m.glamourStyle != "light" {
+			t.Fatalf("resize changed the style to %q", m.glamourStyle)
+		}
+		if m.renderer == nil {
+			t.Fatal("resize should keep a working renderer")
+		}
+	}
+
+	// Rendering must still work at the pinned style.
+	if out := m.render("# Heading"); out == "" {
+		t.Error("render produced nothing")
+	}
+}
+
+// TestNewNeverAutoDetects: an empty style must fall back to a fixed one, not
+// probe the terminal, because New's callers are not all pre-program.
+func TestNewNeverAutoDetects(t *testing.T) {
+	m := New(Options{Runner: &stubRunner{}})
+	if m.glamourStyle == "" {
+		t.Fatal("a style should always be resolved")
+	}
+	if m.glamourStyle == "auto" {
+		t.Error("the style must never be \"auto\": that re-queries the terminal on resize")
+	}
+}
+
+// TestNoTerminalQueryingAPIsInModel is a source-level guard. The failure it
+// prevents is invisible to a normal unit test — it only shows up as garbage in
+// a real terminal — and the fix is easy to undo by reflex, so the constraint is
+// asserted directly.
+//
+// Terminal detection belongs in DetectTheme, which runs before the Bubble Tea
+// program starts.
+func TestNoTerminalQueryingAPIsInModel(t *testing.T) {
+	// Only call expressions count, so the comments explaining this constraint
+	// do not trip it.
+	banned := map[string]string{
+		"WithAutoStyle":     "queries the terminal background; use WithStandardStyle with a style from DetectTheme",
+		"HasDarkBackground": "queries the terminal; call it only from DetectTheme, before the program starts",
+	}
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		// theme.go is where detection is supposed to live.
+		if name == "theme.go" {
+			continue
+		}
+
+		file, err := parser.ParseFile(token.NewFileSet(), name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			var fn string
+			switch target := call.Fun.(type) {
+			case *ast.SelectorExpr:
+				fn = target.Sel.Name
+			case *ast.Ident:
+				fn = target.Name
+			}
+			if why, forbidden := banned[fn]; forbidden {
+				t.Errorf("%s calls %s, which %s", name, fn, why)
+			}
+			return true
+		})
+	}
+}
+
+// fakeSwitcher records real mode switches, standing in for the app.
+type fakeSwitcher struct {
+	available bool
+	governed  bool
+	state     workflow.State
+	calls     []bool
+	err       error
+}
+
+func (s *fakeSwitcher) SetGoverned(on bool) error {
+	s.calls = append(s.calls, on)
+	if s.err != nil {
+		return s.err
+	}
+	s.governed = on
+	if on {
+		s.state = workflow.StatePlanning
+	} else {
+		s.state = ""
+	}
+	return nil
+}
+
+func (s *fakeSwitcher) GovernanceAvailable() bool     { return s.available }
+func (s *fakeSwitcher) WorkflowState() workflow.State { return s.state }
+
+func newSwitchableModel(t *testing.T, governed, available bool) (*Model, *fakeSwitcher) {
+	t.Helper()
+	sw := &fakeSwitcher{available: available, governed: governed}
+	if governed {
+		sw.state = workflow.StatePlanning
+	}
+	m := New(Options{
+		Runner:   &stubRunner{},
+		Switcher: sw,
+		Gates:    testGates(),
+		Governed: governed,
+		State:    sw.state,
+	})
+	m.resize(120, 30)
+	return m, sw
+}
+
+// TestCtrlGTogglesGovernance is the shortcut the status bar advertises.
+func TestCtrlGTogglesGovernance(t *testing.T) {
+	m, sw := newSwitchableModel(t, true, true)
+
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlG})
+	if m.Governed {
+		t.Error("ctrl+g should drop governance")
+	}
+	if len(sw.calls) != 1 || sw.calls[0] != false {
+		t.Fatalf("the switcher should have been asked to disengage: %v", sw.calls)
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlG})
+	if !m.Governed {
+		t.Error("ctrl+g should re-engage governance")
+	}
+	if len(sw.calls) != 2 || sw.calls[1] != true {
+		t.Fatalf("the switcher should have been asked to engage: %v", sw.calls)
+	}
+	if m.State != workflow.StatePlanning {
+		t.Errorf("state should come back from the switcher, got %q", m.State)
+	}
+}
+
+// TestSwitchDelegatesRatherThanRelabelling guards the bug this replaced:
+// /plain used to flip a display flag while the enforcer stayed active, so the
+// message claimed something that had not happened.
+func TestSwitchDelegatesRatherThanRelabelling(t *testing.T) {
+	m, sw := newSwitchableModel(t, true, true)
+
+	m.command("/plain")
+	if len(sw.calls) == 0 {
+		t.Fatal("/plain must delegate to the switcher, not just relabel the status bar")
+	}
+	if sw.governed {
+		t.Error("the switcher should now be ungoverned")
+	}
+}
+
+// TestFailedSwitchDoesNotClaimSuccess: if the switch is refused, the UI must
+// not report a mode it is not in.
+func TestFailedSwitchDoesNotClaimSuccess(t *testing.T) {
+	m, sw := newSwitchableModel(t, false, true)
+	sw.err = errors.New("no git work tree")
+
+	m.setGoverned(true)
+	if m.Governed {
+		t.Error("a refused switch must leave the mode unchanged")
+	}
+	joined := strings.Join(m.transcript, "\n")
+	if !strings.Contains(joined, "no git work tree") {
+		t.Errorf("the reason should be surfaced:\n%s", joined)
+	}
+}
+
+func TestCannotGovernWithoutPolicy(t *testing.T) {
+	m, sw := newSwitchableModel(t, false, false)
+
+	m.setGoverned(true)
+	if len(sw.calls) != 0 {
+		t.Error("the switcher should not be called when governance is unavailable")
+	}
+	if m.Governed {
+		t.Error("mode should be unchanged")
+	}
+	if !strings.Contains(strings.Join(m.transcript, "\n"), "no workflow policy") {
+		t.Errorf("the reason should be explained: %v", m.transcript)
+	}
+}
+
+// TestModeIndicatorShowsCurrentMode: the left side reports where you are.
+func TestModeIndicatorShowsCurrentMode(t *testing.T) {
+	tests := []struct {
+		name      string
+		governed  bool
+		available bool
+		wantWord  string
+	}{
+		{"governed shows the state", true, true, "governed:planning"},
+		{"plain is labelled", false, true, "plain"},
+		{"plain with no policy says why", false, false, "no policy"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _ := newSwitchableModel(t, tc.governed, tc.available)
+			if got := stripANSI(m.modeIndicator()); !strings.Contains(got, tc.wantWord) {
+				t.Errorf("indicator = %q, want it to mention %q", got, tc.wantWord)
+			}
+		})
+	}
+}
+
+// TestHintNamesTheActionNotTheState is the discoverability property: the hint
+// tells you what the key will do, so it reads as an offer.
+func TestHintNamesTheActionNotTheState(t *testing.T) {
+	governed, _ := newSwitchableModel(t, true, true)
+	hint := stripANSI(strings.Join(governed.hints(), " "))
+	if !strings.Contains(hint, "ctrl+g plain") {
+		t.Errorf("a governed session should offer the way out: %q", hint)
+	}
+	if !strings.Contains(hint, "ctrl+w gates") {
+		t.Errorf("a governed session should offer the gate pane: %q", hint)
+	}
+
+	plain, _ := newSwitchableModel(t, false, true)
+	hint = stripANSI(strings.Join(plain.hints(), " "))
+	if !strings.Contains(hint, "ctrl+g govern") {
+		t.Errorf("a plain session should offer the way in: %q", hint)
+	}
+	// The gate pane is meaningless without governance.
+	if strings.Contains(hint, "gates") {
+		t.Errorf("a plain session should not advertise gates: %q", hint)
+	}
+}
+
+// TestNoSwitchHintWhenUnavailable: never offer a key that can only fail.
+func TestNoSwitchHintWhenUnavailable(t *testing.T) {
+	m, _ := newSwitchableModel(t, false, false)
+	if hint := stripANSI(strings.Join(m.hints(), " ")); strings.Contains(hint, "ctrl+g") {
+		t.Errorf("ctrl+g should not be offered when it cannot work: %q", hint)
+	}
+}
+
+// TestStatusBarShowsBothModeAndShortcut is the thing that was missing: the bar
+// has to say where you are *and* how to change it.
+func TestStatusBarShowsBothModeAndShortcut(t *testing.T) {
+	m, _ := newSwitchableModel(t, true, true)
+	bar := stripANSI(m.statusBar())
+
+	for _, want := range []string{"governed:planning", "ctrl+g plain"} {
+		if !strings.Contains(bar, want) {
+			t.Errorf("status bar should contain %q:\n%s", want, bar)
+		}
+	}
+}
+
+func TestSwitchRefusedWhileBusy(t *testing.T) {
+	m, sw := newSwitchableModel(t, true, true)
+	m.busy = true
+
+	m.setGoverned(false)
+	if len(sw.calls) != 0 {
+		t.Error("mode must not change mid-turn")
+	}
+	if !strings.Contains(strings.Join(m.transcript, "\n"), "cancel the current turn") {
+		t.Errorf("the user should be told why: %v", m.transcript)
+	}
+}
+
+func TestSwitchToSameModeIsNoted(t *testing.T) {
+	m, sw := newSwitchableModel(t, true, true)
+	m.setGoverned(true)
+	if len(sw.calls) != 0 {
+		t.Error("switching to the current mode should be a no-op")
+	}
+	if !strings.Contains(strings.Join(m.transcript, "\n"), "already in governed") {
+		t.Errorf("the user should be told: %v", m.transcript)
+	}
+}
+
+func TestGovernCommandAliases(t *testing.T) {
+	for _, cmd := range []string{"/govern", "/gated"} {
+		t.Run(cmd, func(t *testing.T) {
+			m, sw := newSwitchableModel(t, false, true)
+			m.command(cmd)
+			if len(sw.calls) != 1 || !sw.calls[0] {
+				t.Errorf("%s should engage governance: %v", cmd, sw.calls)
+			}
+		})
+	}
+}
+
+func TestModeCommandToggles(t *testing.T) {
+	m, sw := newSwitchableModel(t, true, true)
+	m.command("/mode")
+	if len(sw.calls) != 1 || sw.calls[0] {
+		t.Errorf("/mode should toggle to plain: %v", sw.calls)
+	}
+}
+
+// TestHelpAdvertisesTheShortcut: /help is where a user looks first.
+func TestHelpAdvertisesTheShortcut(t *testing.T) {
+	m, _ := newSwitchableModel(t, true, true)
+	m.command("/help")
+	help := stripANSI(strings.Join(m.transcript, "\n"))
+	for _, want := range []string{"ctrl+g", "/govern", "/plain"} {
+		if !strings.Contains(help, want) {
+			t.Errorf("/help should mention %q:\n%s", want, help)
+		}
+	}
+}
+
+// TestGatePaneFollowsMode: gates are meaningless when ungoverned.
+func TestGatePaneFollowsMode(t *testing.T) {
+	m, _ := newSwitchableModel(t, true, true)
+	if !m.showGates {
+		t.Fatal("a governed session with gates should show the pane")
+	}
+	m.setGoverned(false)
+	if m.showGates {
+		t.Error("dropping governance should hide the gate pane")
+	}
+	m.setGoverned(true)
+	if !m.showGates {
+		t.Error("re-engaging should bring it back")
+	}
+}

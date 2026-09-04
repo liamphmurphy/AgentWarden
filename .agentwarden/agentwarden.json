@@ -1,0 +1,8 @@
+{
+  // Project-level overlay on ~/.config/agentwarden/agentwarden.json. Only the keys
+  // mentioned here are overridden; providers and skills come from global.
+  "workflow": {
+    "enabled": true,
+    "policy": ".agentwarden/workflow.yml"
+  }
+}
