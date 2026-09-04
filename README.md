@@ -18,6 +18,9 @@ model to skip a step.
 └──────────────────────┘
 ```
 
+<img width="1805" height="1075" alt="image" src="https://github.com/user-attachments/assets/588005c9-93a1-46a5-ba37-f495232ce2a5" />
+
+
 ## Why the enforcer lives in the loop
 
 The usual way to enforce an agent workflow is to inspect what the model did and
