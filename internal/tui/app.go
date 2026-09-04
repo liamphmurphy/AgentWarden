@@ -43,6 +43,11 @@ type (
 	blockedMsg struct{ reason string }
 	// gateStartMsg reports a gate beginning.
 	gateStartMsg struct{ id string }
+	// gateOutputMsg carries one streamed output line from a gate.
+	gateOutputMsg struct {
+		id   string
+		line string
+	}
 	// gateDoneMsg reports a gate receipt.
 	gateDoneMsg struct{ receipt workflow.Receipt }
 	// doneMsg reports the loop finishing a run.
@@ -96,6 +101,7 @@ type Model struct {
 	switcher ModeSwitcher
 	models   ModelSwitcher
 	picker   *Picker
+	history  *History
 	events   chan tea.Msg
 
 	viewport viewport.Model
@@ -127,8 +133,11 @@ type Model struct {
 	State workflow.State
 
 	showGates bool
-	err       error
-	cancel    context.CancelFunc
+	// gateTop is the absolute row where the gate pane starts, recorded on
+	// render so a mouse click can be mapped back to a gate row.
+	gateTop int
+	err     error
+	cancel  context.CancelFunc
 
 	// ticking records whether a frame ticker is in flight, so the rate is not
 	// accidentally doubled by restarting an already-running one.
@@ -183,6 +192,7 @@ func New(opts Options) *Model {
 		switcher:     opts.Switcher,
 		models:       opts.Models,
 		picker:       NewPicker(8),
+		history:      NewHistory(0),
 		runner:       opts.Runner,
 		events:       make(chan tea.Msg, 256),
 		viewport:     viewport.New(80, 20),
@@ -286,6 +296,13 @@ func (m *Model) setGoverned(on bool) {
 	m.resize(m.width, m.height)
 }
 
+// recall replaces the input with a history entry, putting the cursor at the
+// end so the recalled prompt can be edited or submitted immediately.
+func (m *Model) recall(entry string) {
+	m.input.SetValue(entry)
+	m.input.CursorEnd()
+}
+
 // note appends a styled one-line message to the transcript.
 func (m *Model) note(style lipgloss.Style, text string) {
 	m.transcript = append(m.transcript, "  "+style.Render(text))
@@ -359,6 +376,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
+
 	case tickMsg:
 		m.tick++
 		// Stop the ticker when nothing is moving: at 30fps an always-on
@@ -403,8 +423,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// A gate may start after the ticker has gone idle.
 		return m, tea.Batch(m.waitForEvent(), m.resumeAnimation())
 
+	case gateOutputMsg:
+		m.gates.Output(msg.id, msg.line)
+		// Expanded output changes the pane's height, so the layout has to be
+		// recomputed or the viewport would overlap it.
+		m.resize(m.width, m.height)
+		return m, m.waitForEvent()
+
 	case gateDoneMsg:
 		m.gates.Finish(msg.receipt)
+		m.resize(m.width, m.height)
 		return m, m.waitForEvent()
 
 	case doneMsg:
@@ -425,6 +453,25 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	return m, cmd
+}
+
+// handleMouse resolves a click to a gate row and toggles it.
+func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
+		return m, nil
+	}
+	if !m.showGates {
+		return m, nil
+	}
+	// gateTop is the absolute row where the pane's border begins, recorded by
+	// the last View: a click arrives against what is currently on screen.
+	// One row of border, so content starts a row lower.
+	row := msg.Y - m.gateTop - 1
+	if index := m.gates.GateAtRow(row); index >= 0 {
+		m.gates.Toggle(index)
+		m.resize(m.width, m.height)
+	}
+	return m, nil
 }
 
 // handleKey processes key input.
@@ -481,6 +528,36 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.resize(m.width, m.height)
 		return m, nil
 
+	case "ctrl+o":
+		// Collapse or expand every gate at once.
+		if m.showGates {
+			m.gates.ToggleAll()
+			m.resize(m.width, m.height)
+		}
+		return m, nil
+
+	case "tab":
+		// Step the gate cursor, so toggling works without a mouse.
+		if m.showGates && m.gates.Len() > 0 {
+			m.gates.Select(1)
+			return m, nil
+		}
+
+	case "shift+tab":
+		if m.showGates && m.gates.Len() > 0 {
+			m.gates.Select(-1)
+			return m, nil
+		}
+
+	case " ":
+		// Space toggles the selected gate, but only when one is selected;
+		// otherwise it is just a space in the prompt.
+		if m.showGates && m.gates.Selected() >= 0 {
+			m.gates.Toggle(m.gates.Selected())
+			m.resize(m.width, m.height)
+			return m, nil
+		}
+
 	case "ctrl+g":
 		// Toggle governance. The hint in the status bar names whichever
 		// direction this will go.
@@ -495,6 +572,25 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.openModelPicker()
 		return m, nil
 
+	case "up":
+		// Only recall history from the first line, so up still moves the
+		// cursor through a multi-line draft as it normally would.
+		if m.input.Line() == 0 {
+			if entry, ok := m.history.Prev(m.input.Value()); ok {
+				m.recall(entry)
+				return m, nil
+			}
+		}
+
+	case "down":
+		// Symmetrically, only step forward from the last line.
+		if m.history.Browsing() && m.input.Line() == m.input.LineCount()-1 {
+			if entry, ok := m.history.Next(); ok {
+				m.recall(entry)
+				return m, nil
+			}
+		}
+
 	case "enter":
 		if m.busy {
 			return m, nil
@@ -504,6 +600,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.input.Reset()
+		// Recorded before dispatch so a slash command is recallable too;
+		// mistyped commands are exactly what one wants to arrow back to.
+		m.history.Add(prompt)
 		if handled, cmd := m.command(prompt); handled {
 			return m, cmd
 		}
@@ -529,7 +628,9 @@ func (m *Model) command(input string) (bool, tea.Cmd) {
 			"/govern   enforce the workflow: gates and stages",
 			"/plain    drop governance, for quick questions",
 			"/auto     toggle auto-approval of tool calls",
-			"/gates    toggle the gate pane (ctrl+w)",
+			"/gates    toggle the gate pane               (ctrl+w)",
+			"          tab selects a gate, space toggles it",
+			"          ctrl+o collapses or expands them all",
 			"/clear    clear the transcript",
 			"/quit     exit",
 		}, "\n")))
@@ -659,6 +760,12 @@ func (m *Model) View() string {
 
 	if m.showGates {
 		if pane := m.gates.View(m.tick); pane != "" {
+			// Rows consumed so far are the viewport plus the picker, each
+			// followed by a newline.
+			m.gateTop = lipglossHeight(m.viewport.View()) + 1
+			if picker := m.picker.View(m.width); picker != "" {
+				m.gateTop += lipglossHeight(picker) + 1
+			}
 			b.WriteString(pane)
 			b.WriteString("\n")
 		}
@@ -731,7 +838,14 @@ func (m *Model) hints() []string {
 		out = append(out, "ctrl+p model")
 	}
 	if m.Governed {
+		// The pane hint stays whichever way it is showing, since ctrl+w is
+		// how you hide it again. The expand/collapse hint is only relevant
+		// once there is something on screen to collapse; clicking itself is
+		// advertised by the ▾/▸ markers on each row.
 		out = append(out, "ctrl+w gates")
+		if m.showGates && m.gates.Len() > 0 {
+			out = append(out, "ctrl+o fold")
+		}
 	}
 	return append(out, "ctrl+d quit")
 }
@@ -771,7 +885,9 @@ func (g *gateProgress) GateStarted(gateID string, _ []string) {
 	g.send(gateStartMsg{id: gateID})
 }
 
-func (g *gateProgress) GateOutput(string, string) {}
+func (g *gateProgress) GateOutput(gateID, line string) {
+	g.send(gateOutputMsg{id: gateID, line: line})
+}
 
 func (g *gateProgress) GateFinished(receipt workflow.Receipt) {
 	g.send(gateDoneMsg{receipt: receipt})

@@ -61,7 +61,11 @@ func (g *GateRunner) RunGate(ctx context.Context, gate workflow.Gate, policyHash
 	}
 
 	g.progress.GateStarted(gate.ID, gate.Command)
-	outcome := g.runner.Run(ctx, gate, g.dir)
+	// Stream each line to the UI as it arrives, so a long suite shows
+	// progress rather than appearing to hang until it finishes.
+	outcome := g.runner.Run(ctx, gate, g.dir, func(line string) {
+		g.progress.GateOutput(gate.ID, line)
+	})
 
 	after, err := g.fingerprinter.Fingerprint(ctx)
 	if err != nil {

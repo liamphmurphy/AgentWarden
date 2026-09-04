@@ -51,16 +51,23 @@ type fakeRunner struct {
 	outcomes map[string]RunOutcome
 	// onRun fires before returning, to mutate external state mid-gate.
 	onRun func(gateID string)
+	// lines maps a gate ID to output lines it should stream as it runs.
+	lines map[string][]string
 }
 
 func newFakeRunner() *fakeRunner {
-	return &fakeRunner{outcomes: map[string]RunOutcome{}}
+	return &fakeRunner{outcomes: map[string]RunOutcome{}, lines: map[string][]string{}}
 }
 
 func exitCode(n int) *int { return &n }
 
-func (r *fakeRunner) Run(_ context.Context, gate workflow.Gate, _ string) RunOutcome {
+func (r *fakeRunner) Run(_ context.Context, gate workflow.Gate, _ string, onLine LineFunc) RunOutcome {
 	r.calls = append(r.calls, gate.ID)
+	if onLine != nil {
+		for _, line := range r.lines[gate.ID] {
+			onLine(line)
+		}
+	}
 	if r.onRun != nil {
 		r.onRun(gate.ID)
 	}
@@ -74,11 +81,16 @@ func (r *fakeRunner) Run(_ context.Context, gate workflow.Gate, _ string) RunOut
 type recordingProgress struct {
 	started  []string
 	finished []workflow.Receipt
+	output   []string
 }
 
 func (p *recordingProgress) GateStarted(id string, _ []string) { p.started = append(p.started, id) }
-func (p *recordingProgress) GateOutput(string, string)         {}
-func (p *recordingProgress) GateFinished(r workflow.Receipt)   { p.finished = append(p.finished, r) }
+
+func (p *recordingProgress) GateOutput(id, line string) {
+	p.output = append(p.output, id+": "+line)
+}
+
+func (p *recordingProgress) GateFinished(r workflow.Receipt) { p.finished = append(p.finished, r) }
 
 func mustPolicy(t *testing.T, doc string) *workflow.Policy {
 	t.Helper()

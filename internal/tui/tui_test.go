@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -1209,5 +1210,651 @@ func TestModelSwitchWithoutSwitcherIsRefused(t *testing.T) {
 	m.applyModel("gw/sonnet")
 	if !strings.Contains(strings.Join(m.transcript, "\n"), "cannot switch model") {
 		t.Errorf("the refusal should be explained: %v", m.transcript)
+	}
+}
+
+// typeAndSubmit simulates typing a prompt, pressing enter, and the turn
+// completing. The completion matters: submitting marks the model busy, and a
+// busy model ignores enter, so without it only the first prompt would land.
+func typeAndSubmit(t *testing.T, m *Model, prompt string) {
+	t.Helper()
+	m.input.SetValue(prompt)
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m.Update(doneMsg{})
+}
+
+func pressUp(m *Model)   { m.Update(tea.KeyMsg{Type: tea.KeyUp}) }
+func pressDown(m *Model) { m.Update(tea.KeyMsg{Type: tea.KeyDown}) }
+
+// TestUpArrowRecallsPreviousPrompt is the headline behaviour.
+func TestUpArrowRecallsPreviousPrompt(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	typeAndSubmit(t, m, "fix the failing test")
+
+	if m.input.Value() != "" {
+		t.Fatalf("submitting should clear the input, got %q", m.input.Value())
+	}
+
+	pressUp(m)
+	if got := m.input.Value(); got != "fix the failing test" {
+		t.Errorf("input = %q, want the previous prompt", got)
+	}
+}
+
+func TestUpArrowWalksBackThroughHistory(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	for _, p := range []string{"first", "second", "third"} {
+		typeAndSubmit(t, m, p)
+	}
+
+	for _, want := range []string{"third", "second", "first"} {
+		pressUp(m)
+		if got := m.input.Value(); got != want {
+			t.Fatalf("input = %q, want %q", got, want)
+		}
+	}
+	// Holding up at the oldest entry stays put.
+	pressUp(m)
+	if got := m.input.Value(); got != "first" {
+		t.Errorf("input = %q, want it to hold at the oldest", got)
+	}
+}
+
+func TestDownArrowWalksForwardAndRestoresDraft(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	typeAndSubmit(t, m, "older")
+	typeAndSubmit(t, m, "newer")
+
+	m.input.SetValue("half-written thought")
+	pressUp(m)
+	pressUp(m)
+	if got := m.input.Value(); got != "older" {
+		t.Fatalf("input = %q, want older", got)
+	}
+
+	pressDown(m)
+	if got := m.input.Value(); got != "newer" {
+		t.Fatalf("input = %q, want newer", got)
+	}
+	pressDown(m)
+	if got := m.input.Value(); got != "half-written thought" {
+		t.Errorf("input = %q, want the draft restored", got)
+	}
+}
+
+// TestUpArrowMovesCursorInMultilineDraft: history must not hijack the arrow
+// key while there is a draft to navigate.
+func TestUpArrowMovesCursorInMultilineDraft(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	typeAndSubmit(t, m, "a previous prompt")
+
+	m.input.SetValue("line one\nline two")
+	m.input.CursorEnd()
+	if m.input.Line() == 0 {
+		t.Fatal("precondition: cursor should be on the second line")
+	}
+
+	pressUp(m)
+	// The draft survives; the cursor just moved up a line.
+	if got := m.input.Value(); got != "line one\nline two" {
+		t.Errorf("input = %q, want the draft untouched", got)
+	}
+	if m.input.Line() != 0 {
+		t.Errorf("cursor line = %d, want 0", m.input.Line())
+	}
+
+	// Now on the first line, up recalls history.
+	pressUp(m)
+	if got := m.input.Value(); got != "a previous prompt" {
+		t.Errorf("input = %q, want the recalled prompt", got)
+	}
+}
+
+// TestDownArrowMovesCursorInsteadOfSteppingForward is the symmetric case.
+func TestDownArrowMovesCursorInRecalledMultilineEntry(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	typeAndSubmit(t, m, "line one\nline two")
+	typeAndSubmit(t, m, "single")
+
+	pressUp(m)
+	pressUp(m) // the multi-line entry
+	if got := m.input.Value(); got != "line one\nline two" {
+		t.Fatalf("input = %q", got)
+	}
+	// CursorStart moves to the start of the current line, not of the text, so
+	// stepping up is what reaches line 0.
+	m.input.CursorUp()
+	if m.input.Line() != 0 {
+		t.Fatalf("precondition: cursor should be on the first line, got %d", m.input.Line())
+	}
+
+	pressDown(m)
+	// Still the same entry: down moved the cursor within it.
+	if got := m.input.Value(); got != "line one\nline two" {
+		t.Errorf("input = %q, want the entry unchanged", got)
+	}
+}
+
+func TestDownArrowDoesNothingWhenNotBrowsing(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	typeAndSubmit(t, m, "something")
+	m.input.SetValue("current draft")
+
+	pressDown(m)
+	if got := m.input.Value(); got != "current draft" {
+		t.Errorf("input = %q, want it untouched", got)
+	}
+}
+
+func TestUpArrowWithEmptyHistoryDoesNothing(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.input.SetValue("typing")
+	pressUp(m)
+	if got := m.input.Value(); got != "typing" {
+		t.Errorf("input = %q, want it untouched", got)
+	}
+}
+
+// TestSubmittingResetsBrowsing: after sending, up should give the newest
+// entry, not resume mid-walk.
+func TestSubmittingResetsBrowsing(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	typeAndSubmit(t, m, "one")
+	typeAndSubmit(t, m, "two")
+
+	pressUp(m)
+	pressUp(m) // now showing "one"
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	pressUp(m)
+	if got := m.input.Value(); got != "one" {
+		t.Errorf("input = %q, want the just-submitted prompt", got)
+	}
+}
+
+func TestRecalledPromptCanBeEditedAndResubmitted(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	typeAndSubmit(t, m, "run the tests")
+
+	pressUp(m)
+	// Cursor sits at the end, so typing appends.
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" again")})
+	if got := m.input.Value(); got != "run the tests again" {
+		t.Fatalf("input = %q, want the edit appended", got)
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if got := m.history.Entries(); len(got) != 2 || got[1] != "run the tests again" {
+		t.Errorf("entries = %v, want the edited prompt recorded", got)
+	}
+}
+
+// TestSlashCommandsAreRecallable: a mistyped command is exactly what one wants
+// to arrow back to.
+func TestSlashCommandsAreRecallable(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	typeAndSubmit(t, m, "/modle")
+
+	pressUp(m)
+	if got := m.input.Value(); got != "/modle" {
+		t.Errorf("input = %q, want the mistyped command back", got)
+	}
+}
+
+func TestBlankSubmissionIsNotRecorded(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	typeAndSubmit(t, m, "real prompt")
+	m.input.SetValue("   ")
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if got := m.history.Entries(); len(got) != 1 {
+		t.Errorf("entries = %v, want only the real prompt", got)
+	}
+}
+
+// TestPickerKeepsArrowKeysWhileOpen: the picker is checked first, so browsing
+// models must not also walk the prompt history.
+func TestPickerKeepsArrowKeysWhileOpen(t *testing.T) {
+	m, _ := newPickableModel(t)
+	typeAndSubmit(t, m, "a previous prompt")
+	m.busy = false
+
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+	before := m.input.Value()
+
+	pressUp(m)
+	pressDown(m)
+	if m.input.Value() != before {
+		t.Errorf("the input changed while the picker was open: %q", m.input.Value())
+	}
+	if !m.picker.IsOpen() {
+		t.Error("arrow keys should still be driving the picker")
+	}
+}
+
+func gateReceipt(id string, success bool, ms int64, reason, stdout string) workflow.Receipt {
+	code := 0
+	if !success {
+		code = 1
+	}
+	return workflow.Receipt{
+		GateID: id, Success: success, ExitCode: &code,
+		FailureReason: reason, DurationMS: ms, Stdout: stdout,
+	}
+}
+
+// TestGateDetailShownByDefault: the point of the pane is to show what the
+// runtime did, so hiding it is opt-in.
+func TestGateDetailShownByDefault(t *testing.T) {
+	m, _ := newSwitchableModel(t, true, true)
+	m.Update(gateStartMsg{id: "unit"})
+	m.Update(gateOutputMsg{id: "unit", line: "ok  pkg/api  0.4s"})
+
+	view := stripANSI(m.gates.View(0))
+	if !strings.Contains(view, "ok  pkg/api") {
+		t.Errorf("streamed output should be visible without asking:\n%s", view)
+	}
+	if !strings.Contains(view, "$ go test ./...") {
+		t.Errorf("the command should be shown:\n%s", view)
+	}
+	if m.gates.Collapsed(0) {
+		t.Error("gates should start expanded")
+	}
+}
+
+// TestStreamedOutputReachesThePane closes the loop that was previously dead:
+// GateOutput was declared but never called, so nothing streamed at all.
+func TestStreamedOutputReachesThePane(t *testing.T) {
+	m, _ := newSwitchableModel(t, true, true)
+	m.Update(gateStartMsg{id: "unit"})
+	for _, line := range []string{"first line", "second line", "third line"} {
+		m.Update(gateOutputMsg{id: "unit", line: line})
+	}
+
+	view := stripANSI(m.gates.View(0))
+	for _, want := range []string{"first line", "second line", "third line"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("output %q should be shown:\n%s", want, view)
+		}
+	}
+}
+
+func TestGateToggleHidesAndRestoresDetail(t *testing.T) {
+	m, _ := newSwitchableModel(t, true, true)
+	m.Update(gateStartMsg{id: "unit"})
+	m.Update(gateOutputMsg{id: "unit", line: "revealing detail"})
+
+	m.gates.Toggle(0)
+	view := stripANSI(m.gates.View(0))
+	if strings.Contains(view, "revealing detail") {
+		t.Errorf("collapsed detail should be hidden:\n%s", view)
+	}
+	// Nothing should vanish silently: the header says how much is hidden.
+	if !strings.Contains(view, "1 lines hidden") {
+		t.Errorf("a collapsed gate should say what it is hiding:\n%s", view)
+	}
+	if !strings.Contains(view, "unit") {
+		t.Errorf("the header stays visible:\n%s", view)
+	}
+
+	m.gates.Toggle(0)
+	if !strings.Contains(stripANSI(m.gates.View(0)), "revealing detail") {
+		t.Error("toggling again should restore the detail")
+	}
+}
+
+// TestCollapseMarkerReflectsState: the marker is the click affordance, so it
+// has to be right.
+func TestCollapseMarkerReflectsState(t *testing.T) {
+	m, _ := newSwitchableModel(t, true, true)
+	m.Update(gateStartMsg{id: "unit"})
+	m.Update(gateOutputMsg{id: "unit", line: "x"})
+
+	if !strings.Contains(stripANSI(m.gates.View(0)), "▾") {
+		t.Error("an expanded gate should show the open marker")
+	}
+	m.gates.Toggle(0)
+	if !strings.Contains(stripANSI(m.gates.View(0)), "▸") {
+		t.Error("a collapsed gate should show the closed marker")
+	}
+}
+
+func TestGateWithNoDetailHasNoMarker(t *testing.T) {
+	// A pending gate with no command and no output has nothing to expand.
+	pane := NewGatePane([]workflow.Gate{{ID: "bare"}})
+	view := stripANSI(pane.View(0))
+	for _, marker := range []string{"▾", "▸"} {
+		if strings.Contains(view, marker) {
+			t.Errorf("a gate with nothing to show should not offer a toggle:\n%s", view)
+		}
+	}
+}
+
+// TestClickTogglesGate is the interaction the request asked for.
+func TestClickTogglesGate(t *testing.T) {
+	m, _ := newSwitchableModel(t, true, true)
+	m.Update(gateStartMsg{id: "unit"})
+	m.Update(gateOutputMsg{id: "unit", line: "detail line"})
+	// Render so the pane records its row mapping and absolute position.
+	_ = m.View()
+
+	// The first gate's header is the first content row, one below the border.
+	// The row is recomputed after each render because collapsing shrinks the
+	// pane, which moves it down the screen.
+	clickFirstGate := func() {
+		m.Update(tea.MouseMsg{
+			Action: tea.MouseActionPress,
+			Button: tea.MouseButtonLeft,
+			Y:      m.gateTop + 1,
+		})
+	}
+
+	clickFirstGate()
+	if !m.gates.Collapsed(0) {
+		t.Error("clicking a gate header should collapse it")
+	}
+
+	_ = m.View()
+	clickFirstGate()
+	if m.gates.Collapsed(0) {
+		t.Error("clicking again should expand it")
+	}
+}
+
+func TestClickOutsideGatePaneIsIgnored(t *testing.T) {
+	m, _ := newSwitchableModel(t, true, true)
+	m.Update(gateStartMsg{id: "unit"})
+	_ = m.View()
+
+	for _, y := range []int{0, m.gateTop, m.height - 1} {
+		m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, Y: y})
+	}
+	if m.gates.Collapsed(0) {
+		t.Error("clicks outside a gate header should not toggle anything")
+	}
+}
+
+func TestNonLeftClicksIgnored(t *testing.T) {
+	m, _ := newSwitchableModel(t, true, true)
+	m.Update(gateStartMsg{id: "unit"})
+	_ = m.View()
+
+	y := m.gateTop + 1
+	for _, msg := range []tea.MouseMsg{
+		{Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft, Y: y},
+		{Action: tea.MouseActionMotion, Button: tea.MouseButtonNone, Y: y},
+		{Action: tea.MouseActionPress, Button: tea.MouseButtonRight, Y: y},
+		{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp, Y: y},
+	} {
+		m.Update(msg)
+	}
+	if m.gates.Collapsed(0) {
+		t.Error("only a left press should toggle")
+	}
+}
+
+func TestClickIgnoredWhenPaneHidden(t *testing.T) {
+	m, _ := newSwitchableModel(t, true, true)
+	m.Update(gateStartMsg{id: "unit"})
+	_ = m.View()
+	y := m.gateTop + 1
+
+	m.showGates = false
+	m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, Y: y})
+	if m.gates.Collapsed(0) {
+		t.Error("a hidden pane should not receive clicks")
+	}
+}
+
+// TestClickOnDetailRowTogglesItsGate: clicking anywhere in a gate's block
+// should act on that gate, not miss.
+func TestClickOnDetailRowTogglesItsGate(t *testing.T) {
+	m, _ := newSwitchableModel(t, true, true)
+	m.Update(gateStartMsg{id: "unit"})
+	m.Update(gateOutputMsg{id: "unit", line: "some output"})
+	_ = m.View()
+
+	// Row 0 is the header, row 1 the command, row 2 the output line.
+	m.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress, Button: tea.MouseButtonLeft,
+		Y: m.gateTop + 1 + 2,
+	})
+	if !m.gates.Collapsed(0) {
+		t.Error("clicking a detail row should toggle the gate it belongs to")
+	}
+}
+
+// TestKeyboardTogglesGate: a TUI must be usable without a mouse.
+func TestKeyboardTogglesGate(t *testing.T) {
+	m, _ := newSwitchableModel(t, true, true)
+	m.Update(gateStartMsg{id: "unit"})
+	m.Update(gateOutputMsg{id: "unit", line: "detail"})
+
+	if m.gates.Selected() != -1 {
+		t.Fatal("nothing should be selected initially")
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if m.gates.Selected() != 0 {
+		t.Fatalf("tab should select the first gate, got %d", m.gates.Selected())
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}})
+	if !m.gates.Collapsed(0) {
+		t.Error("space should toggle the selected gate")
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if m.gates.Selected() != 1 {
+		t.Errorf("tab should advance to the next gate, got %d", m.gates.Selected())
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	if m.gates.Selected() != 0 {
+		t.Errorf("shift+tab should step back, got %d", m.gates.Selected())
+	}
+}
+
+// TestSpaceStillTypesWhenNoGateSelected: the toggle must not steal the space
+// bar from the prompt.
+func TestSpaceStillTypesWhenNoGateSelected(t *testing.T) {
+	m, _ := newSwitchableModel(t, true, true)
+	m.gates.ClearSelection()
+	m.input.SetValue("two")
+
+	m.Update(tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}})
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("words")})
+	if got := m.input.Value(); got != "two words" {
+		t.Errorf("input = %q, want the space to reach the prompt", got)
+	}
+}
+
+func TestCtrlOFoldsAndUnfoldsEverything(t *testing.T) {
+	m, _ := newSwitchableModel(t, true, true)
+	m.Update(gateStartMsg{id: "unit"})
+	m.Update(gateOutputMsg{id: "unit", line: "a"})
+	m.Update(gateStartMsg{id: "integration"})
+	m.Update(gateOutputMsg{id: "integration", line: "b"})
+
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+	if !m.gates.Collapsed(0) || !m.gates.Collapsed(1) {
+		t.Error("ctrl+o should collapse every gate")
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+	if m.gates.Collapsed(0) || m.gates.Collapsed(1) {
+		t.Error("ctrl+o again should expand every gate")
+	}
+
+	// A mixed state expands, since revealing is the safer default.
+	m.gates.Toggle(0)
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+	if m.gates.Collapsed(0) || m.gates.Collapsed(1) {
+		t.Error("a partially collapsed pane should expand")
+	}
+}
+
+// TestFailingGateShowsItsOutput is why this matters: a blocked completion has
+// to be explainable from the screen.
+func TestFailingGateShowsItsOutput(t *testing.T) {
+	m, _ := newSwitchableModel(t, true, true)
+	m.Update(gateStartMsg{id: "unit"})
+	m.Update(gateDoneMsg{receipt: gateReceipt("unit", false, 2400, "command_failed",
+		"--- FAIL: TestAdd\n    add_test.go:7: Add(2,3) = -1, want 5\n")})
+
+	view := stripANSI(m.gates.View(0))
+	for _, want := range []string{"unit", "command_failed", "want 5"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("view should contain %q:\n%s", want, view)
+		}
+	}
+}
+
+// TestReceiptOutputUsedWhenNothingStreamed covers a command that buffered its
+// output, or a runner that does not stream.
+func TestReceiptOutputUsedWhenNothingStreamed(t *testing.T) {
+	pane := NewGatePane(testGates())
+	pane.Finish(gateReceipt("unit", true, 100, "", "buffered line\n"))
+
+	if !strings.Contains(stripANSI(pane.View(0)), "buffered line") {
+		t.Error("the receipt's captured output should be shown when nothing streamed")
+	}
+}
+
+// TestStreamedOutputNotOverwrittenByReceipt: the streamed lines are the live
+// record and should not be replaced when the receipt lands.
+func TestStreamedOutputNotOverwrittenByReceipt(t *testing.T) {
+	pane := NewGatePane(testGates())
+	pane.Start("unit")
+	pane.Output("unit", "streamed line")
+	pane.Finish(gateReceipt("unit", true, 100, "", "different captured text\n"))
+
+	view := stripANSI(pane.View(0))
+	if !strings.Contains(view, "streamed line") {
+		t.Errorf("streamed output should survive:\n%s", view)
+	}
+	if strings.Contains(view, "different captured text") {
+		t.Errorf("it should not be duplicated from the receipt:\n%s", view)
+	}
+}
+
+// TestLongOutputShowsTail: a failure's cause is at the end.
+func TestLongOutputShowsTail(t *testing.T) {
+	pane := NewGatePane(testGates())
+	pane.Start("unit")
+	for i := range 40 {
+		pane.Output("unit", fmt.Sprintf("line %d", i))
+	}
+
+	view := stripANSI(pane.View(0))
+	if !strings.Contains(view, "line 39") {
+		t.Errorf("the last line should be visible:\n%s", view)
+	}
+	if strings.Contains(view, "line 0\n") {
+		t.Errorf("early lines should be trimmed:\n%s", view)
+	}
+	if !strings.Contains(view, "earlier lines") {
+		t.Errorf("the trim should be acknowledged:\n%s", view)
+	}
+}
+
+func TestOutputIsCapped(t *testing.T) {
+	pane := NewGatePane(testGates())
+	pane.Start("unit")
+	for i := range maxOutputLines + 250 {
+		pane.Output("unit", fmt.Sprintf("line %d", i))
+	}
+	if got := len(pane.gates[0].Output); got != maxOutputLines {
+		t.Errorf("retained %d lines, want the cap of %d", got, maxOutputLines)
+	}
+}
+
+func TestBlankOutputLinesIgnored(t *testing.T) {
+	pane := NewGatePane(testGates())
+	pane.Start("unit")
+	for _, line := range []string{"", "   ", "\t", "real"} {
+		pane.Output("unit", line)
+	}
+	if got := pane.gates[0].Output; len(got) != 1 || got[0] != "real" {
+		t.Errorf("output = %v, want only the real line", got)
+	}
+}
+
+func TestOutputForUnknownGateIgnored(t *testing.T) {
+	pane := NewGatePane(testGates())
+	pane.Output("nonexistent", "line")
+	for i := range pane.gates {
+		if len(pane.gates[i].Output) != 0 {
+			t.Error("output for an unknown gate should be dropped")
+		}
+	}
+}
+
+// TestResetKeepsExpansionState: collapsing is a display preference, not run
+// state, so a re-run should not undo it.
+func TestResetKeepsExpansionState(t *testing.T) {
+	pane := NewGatePane(testGates())
+	pane.Start("unit")
+	pane.Output("unit", "old run")
+	pane.Toggle(0)
+
+	pane.Reset()
+	if !pane.Collapsed(0) {
+		t.Error("expansion state should survive a reset")
+	}
+	if len(pane.gates[0].Output) != 0 {
+		t.Error("output should be cleared by a reset")
+	}
+}
+
+func TestGateSelectClamps(t *testing.T) {
+	pane := NewGatePane(testGates())
+	pane.Select(-5)
+	if pane.Selected() != 0 {
+		t.Errorf("first Select should land on 0, got %d", pane.Selected())
+	}
+	pane.Select(-5)
+	if pane.Selected() != 0 {
+		t.Errorf("selection should clamp at the top, got %d", pane.Selected())
+	}
+	pane.Select(99)
+	if pane.Selected() != pane.Len()-1 {
+		t.Errorf("selection should clamp at the bottom, got %d", pane.Selected())
+	}
+}
+
+func TestGateSelectOnEmptyPaneIsSafe(t *testing.T) {
+	pane := NewGatePane(nil)
+	pane.Select(1)
+	pane.Toggle(0)
+	pane.ToggleAll()
+	if pane.View(0) != "" {
+		t.Error("an empty pane renders nothing")
+	}
+}
+
+func TestGateAtRowOutOfRange(t *testing.T) {
+	pane := NewGatePane(testGates())
+	pane.View(0)
+	for _, row := range []int{-1, 9999} {
+		if got := pane.GateAtRow(row); got != -1 {
+			t.Errorf("GateAtRow(%d) = %d, want -1", row, got)
+		}
+	}
+}
+
+func TestPaneGrowthTriggersRelayout(t *testing.T) {
+	m, _ := newSwitchableModel(t, true, true)
+	before := m.viewport.Height
+
+	m.Update(gateStartMsg{id: "unit"})
+	for i := range 6 {
+		m.Update(gateOutputMsg{id: "unit", line: fmt.Sprintf("line %d", i)})
+	}
+	// The pane got taller, so the viewport must have given up rows.
+	if m.viewport.Height >= before {
+		t.Errorf("viewport height %d should have shrunk from %d as the pane grew",
+			m.viewport.Height, before)
+	}
+	// And the input must still be on screen.
+	if !strings.Contains(stripANSI(m.View()), "Ask anything") {
+		t.Error("the input should still be visible")
 	}
 }

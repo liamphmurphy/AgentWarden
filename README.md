@@ -453,11 +453,33 @@ serves whatever has been pulled.
 
 | Key | Action |
 |---|---|
+| `↑` / `↓` | Walk back and forward through prompt history |
 | `ctrl+g` | Toggle governed / plain |
 | `ctrl+p` | Switch provider / model |
 | `ctrl+w` | Toggle the gate pane |
 | `ctrl+c` | Cancel the running turn (or quit when idle) |
 | `ctrl+d` | Quit |
+
+### Prompt history
+
+`↑` recalls the previous prompt, most recent first; `↓` walks back towards the
+present. A recalled prompt lands with the cursor at the end, so it can be
+edited and resubmitted.
+
+Two details that make it behave the way a shell does:
+
+- **Your draft is not lost.** Whatever is typed when you first press `↑` is
+  stashed, and arrowing forward past the newest entry restores it. Glancing
+  back through history never discards a half-written prompt.
+- **The arrow keys still move the cursor.** History only engages when the
+  cursor is on the first line (for `↑`) or the last (for `↓`), so a multi-line
+  draft navigates normally. While the model picker is open, the arrows drive
+  the picker instead.
+
+Blank prompts are skipped and consecutive duplicates collapse, so re-running
+the same command twice does not mean pressing `↑` twice to get past it. Slash
+commands are recorded too — a mistyped `/modle` is exactly what you want back.
+History is per session and holds the last 200 prompts.
 
 `/help` · `/model` · `/mode` · `/govern` · `/plain` · `/auto` · `/gates` · `/clear` · `/quit`
 

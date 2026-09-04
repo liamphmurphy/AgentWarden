@@ -740,7 +740,9 @@ func (a *app) runTUI() error {
 	// takes effect without rebuilding anything.
 	model.SetRunner(&governedRunner{app: a, loop: loop})
 
-	program := tea.NewProgram(model, tea.WithAltScreen())
+	// Mouse cell motion enables click-to-toggle on the gate pane. Keyboard
+	// equivalents exist too, so this is an addition rather than a dependency.
+	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err := program.Run()
 	return err
 }

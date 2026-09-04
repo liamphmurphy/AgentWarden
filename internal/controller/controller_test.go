@@ -34,7 +34,7 @@ type fakeRunner struct {
 	onRun    func(gateID string)
 }
 
-func (r *fakeRunner) Run(_ context.Context, gate workflow.Gate, _ string) enforce.RunOutcome {
+func (r *fakeRunner) Run(_ context.Context, gate workflow.Gate, _ string, _ enforce.LineFunc) enforce.RunOutcome {
 	r.calls = append(r.calls, gate.ID)
 	if r.onRun != nil {
 		r.onRun(gate.ID)

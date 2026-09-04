@@ -106,8 +106,13 @@ editing a test to make a change pass, stop and reconsider the change.
 
 11. **An open picker owns the keyboard.** `handleKey` checks
     `picker.IsOpen()` before the normal bindings, so `enter` selects a row
-    rather than submitting the half-typed prompt behind the overlay.
-    See `TestPickerOwnsEnterWhileOpen`.
+    rather than submitting the half-typed prompt behind the overlay, and the
+    arrow keys drive the picker rather than the prompt history.
+    See `TestPickerOwnsEnterWhileOpen` and `TestPickerKeepsArrowKeysWhileOpen`.
+
+    Key precedence in `handleKey` is: picker, then history, then the textarea.
+    History only engages at the edge line (`input.Line() == 0` for up, the last
+    line for down) so a multi-line draft still navigates normally.
 
 12. **Terminal capability detection happens before the program starts.**
     Querying the background colour writes an escape sequence and reads the
