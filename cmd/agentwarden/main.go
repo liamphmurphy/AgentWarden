@@ -180,25 +180,26 @@ func run() error {
 
 // app holds everything a session needs.
 type app struct {
-	cfg          *config.Config
-	project      string
-	governed     bool
-	policy       *workflow.Policy
-	ctl          *controller.Controller
-	tools        *tool.Registry
-	governor     enforce.Governor
-	perms        *enforce.Permissions
-	provider     provider.Provider
-	modelID      string
-	modelRef     string
-	agentDef     *agent.Definition
-	task         *workflow.Task
-	conversation []provider.Message
-	gateRun      *enforce.GateRunner
-	logFile      *os.File
-	actor        *controller.Actor
-	skills       *skill.Set
-	agents       *agent.Registry
+	cfg                 *config.Config
+	project             string
+	governed            bool
+	policy              *workflow.Policy
+	ctl                 *controller.Controller
+	tools               *tool.Registry
+	governor            enforce.Governor
+	perms               *enforce.Permissions
+	provider            provider.Provider
+	modelID             string
+	modelRef            string
+	agentDef            *agent.Definition
+	task                *workflow.Task
+	conversation        []provider.Message
+	gateRun             *enforce.GateRunner
+	logFile             *os.File
+	actor               *controller.Actor
+	skills              *skill.Set
+	agents              *agent.Registry
+	projectInstructions string
 	// agentExplicit records that the user named the agent with -agent, which
 	// is honoured in plain mode too; a merely configured default is not, since
 	// defaultAgent is the identity a governed session starts from.
@@ -463,6 +464,10 @@ func assemble(opts options) (*app, error) {
 	}
 	skillDirs := config.ExpandDirs(cfg.SkillDirs, home, project)
 	a.skills, err = skill.Load(skillDirs)
+	if err != nil {
+		return nil, err
+	}
+	a.projectInstructions, err = agent.LoadProjectInstructions(project)
 	if err != nil {
 		return nil, err
 	}
@@ -823,6 +828,9 @@ func (a *app) systemPrompt() string {
 			fmt.Fprintf(os.Stderr, "agentwarden: agent %q references unknown skill %q\n",
 				skillSource.Name, name)
 		}
+	}
+	if a.projectInstructions != "" {
+		parts = append(parts, a.projectInstructions)
 	}
 	return strings.Join(parts, "\n\n")
 }

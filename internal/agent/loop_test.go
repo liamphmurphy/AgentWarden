@@ -412,6 +412,9 @@ func TestTurnEndWithoutHandoffIsCorrected(t *testing.T) {
 	for _, m := range loop.Messages() {
 		if m.Role == provider.RoleUser && strings.Contains(m.Text, enforce.ToolSubmitPlan) {
 			corrected = true
+			if !m.Internal {
+				t.Error("the workflow correction should be marked internal")
+			}
 		}
 	}
 	if !corrected {

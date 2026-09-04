@@ -219,6 +219,35 @@ func TestParseRejectsInvalidFrontmatter(t *testing.T) {
 	}
 }
 
+func TestLoadProjectInstructions(t *testing.T) {
+	t.Run("missing file is optional", func(t *testing.T) {
+		got, err := LoadProjectInstructions(t.TempDir())
+		if err != nil {
+			t.Fatalf("LoadProjectInstructions: %v", err)
+		}
+		if got != "" {
+			t.Errorf("instructions = %q, want empty", got)
+		}
+	})
+
+	t.Run("loads and trims project file", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, InstructionsFileName)
+		if err := os.WriteFile(path, []byte("\n# Local rules\n\nKeep the change small.\n\n"), 0o644); err != nil {
+			t.Fatalf("write instructions: %v", err)
+		}
+
+		got, err := LoadProjectInstructions(dir)
+		if err != nil {
+			t.Fatalf("LoadProjectInstructions: %v", err)
+		}
+		want := "# Local rules\n\nKeep the change small."
+		if got != want {
+			t.Errorf("instructions = %q, want %q", got, want)
+		}
+	})
+}
+
 func TestLoadRegistryPrecedence(t *testing.T) {
 	global := t.TempDir()
 	project := t.TempDir()

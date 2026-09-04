@@ -146,7 +146,26 @@ func (s *Store) LoadMessages(taskID string) ([]provider.Message, error) {
 	if err := json.Unmarshal(raw, &messages); err != nil {
 		return nil, fmt.Errorf("parse messages for %s: %w", taskID, err)
 	}
+	markLegacyInternalMessages(messages)
 	return messages, nil
+}
+
+// markLegacyInternalMessages preserves checkpoints written before Message
+// carried an Internal marker. These strings were emitted only by the runtime;
+// recognizing their exact prefixes prevents old corrections being replayed
+// in the TUI as if the user had typed them.
+func markLegacyInternalMessages(messages []provider.Message) {
+	for i := range messages {
+		if messages[i].Role != provider.RoleUser {
+			continue
+		}
+		text := messages[i].Text
+		if strings.HasPrefix(text, "BLOCKED: the turn ended in state ") ||
+			strings.HasPrefix(text, "Governance has been switched OFF for this session.") ||
+			strings.HasPrefix(text, "Governance has been switched ON for this session.") {
+			messages[i].Internal = true
+		}
+	}
 }
 
 // List returns every task ID, sorted.

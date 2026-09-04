@@ -446,6 +446,23 @@ func TestMessagesAndToolResultsSerialized(t *testing.T) {
 	if len(assistant.ToolCalls) != 1 || assistant.ToolCalls[0].Function.Name != "read" {
 		t.Errorf("assistant tool call not serialized: %+v", assistant)
 	}
+	var rawBody struct {
+		Messages []map[string]json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(*captured, &rawBody); err != nil {
+		t.Fatalf("captured body fields: %v", err)
+	}
+	content, present := rawBody.Messages[2]["content"]
+	if !present {
+		t.Error("assistant message with empty text omitted content, want an explicit string")
+	} else {
+		var text string
+		if err := json.Unmarshal(content, &text); err != nil {
+			t.Errorf("assistant content = %s, want a JSON string: %v", content, err)
+		} else if text != "" {
+			t.Errorf("assistant content = %q, want an empty string", text)
+		}
+	}
 	result := body.Messages[3]
 	if result.Role != "tool" || result.ToolCallID != "c1" || result.Content != "file contents" {
 		t.Errorf("tool result not serialized: %+v", result)

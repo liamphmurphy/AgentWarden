@@ -277,6 +277,9 @@ func New(opts Options) *Model {
 // not chat entries, so they stay out of the transcript.
 func (m *Model) restoreMessages(messages []provider.Message) {
 	for _, message := range messages {
+		if message.Internal {
+			continue
+		}
 		switch message.Role {
 		case provider.RoleUser:
 			if strings.TrimSpace(message.Text) != "" {

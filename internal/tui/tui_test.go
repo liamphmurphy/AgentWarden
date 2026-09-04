@@ -454,6 +454,7 @@ func TestNewRestoresConversationTranscript(t *testing.T) {
 		Messages: []provider.Message{
 			{Role: provider.RoleSystem, Text: "system instructions"},
 			{Role: provider.RoleUser, Text: "inspect the service"},
+			{Role: provider.RoleUser, Text: "BLOCKED: internal workflow correction", Internal: true},
 			{Role: provider.RoleAssistant, Text: "I found the handler."},
 		},
 	})
@@ -466,6 +467,9 @@ func TestNewRestoresConversationTranscript(t *testing.T) {
 	}
 	if !strings.Contains(stripANSI(strings.Join(m.transcript, "\n")), "I found the handler.") {
 		t.Error("restored transcript is missing the assistant message")
+	}
+	if strings.Contains(stripANSI(strings.Join(m.transcript, "\n")), "internal workflow correction") {
+		t.Error("restored transcript includes a runtime-internal correction")
 	}
 }
 

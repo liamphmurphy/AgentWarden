@@ -155,6 +155,16 @@ func TestGovernedPromptIncludesStageSkills(t *testing.T) {
 	}
 }
 
+func TestPromptIncludesProjectInstructions(t *testing.T) {
+	a := newTestApp(t)
+	a.projectInstructions = "# Project rules\n\nRun the focused tests."
+
+	got := a.systemPrompt()
+	if !strings.Contains(got, a.projectInstructions) {
+		t.Errorf("project instructions missing from prompt:\n%s", got)
+	}
+}
+
 // Plain mode has no stage, so no role prompt applies. A workflow agent's
 // instructions describe a workflow that is not running, which is what makes an
 // ungoverned session narrate a planning stage that does not exist.

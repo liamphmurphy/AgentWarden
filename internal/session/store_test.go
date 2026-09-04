@@ -73,6 +73,7 @@ func TestMessagesRoundTrip(t *testing.T) {
 	want := []provider.Message{
 		{Role: provider.RoleUser, Text: "inspect the service"},
 		{Role: provider.RoleAssistant, Text: "I found the handler."},
+		{Role: provider.RoleUser, Text: "runtime correction", Internal: true},
 	}
 
 	if err := store.SaveMessages("t1", want); err != nil {
@@ -84,6 +85,29 @@ func TestMessagesRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("LoadMessages(%q) = %#v, want %#v", "t1", got, want)
+	}
+}
+
+func TestLoadMessagesMarksLegacyWorkflowCorrectionsInternal(t *testing.T) {
+	store := NewStore(t.TempDir())
+	wantVisible := "BLOCKED is a useful word in this user-authored prompt"
+	messages := []provider.Message{
+		{Role: provider.RoleUser, Text: wantVisible},
+		{Role: provider.RoleUser, Text: "BLOCKED: the turn ended in state planning without calling workflow_submit_plan"},
+	}
+	if err := store.SaveMessages("t1", messages); err != nil {
+		t.Fatalf("SaveMessages: %v", err)
+	}
+
+	got, err := store.LoadMessages("t1")
+	if err != nil {
+		t.Fatalf("LoadMessages: %v", err)
+	}
+	if got[0].Internal {
+		t.Errorf("LoadMessages(user prompt).Internal = true, want false: %q", wantVisible)
+	}
+	if !got[1].Internal {
+		t.Errorf("LoadMessages(legacy correction).Internal = false, want true: %q", got[1].Text)
 	}
 }
 

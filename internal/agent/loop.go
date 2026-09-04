@@ -166,7 +166,11 @@ func (l *Loop) Note(text string) {
 	if text == "" {
 		return
 	}
-	l.messages = append(l.messages, provider.Message{Role: provider.RoleUser, Text: text})
+	l.messages = append(l.messages, provider.Message{
+		Role:     provider.RoleUser,
+		Text:     text,
+		Internal: true,
+	})
 }
 
 // observer returns a non-nil Observer.
@@ -266,8 +270,9 @@ func (l *Loop) Run(ctx context.Context, prompt string) (Result, error) {
 				result.Blocked++
 				l.session().ForcedTool = decision.ForceTool
 				l.messages = append(l.messages, provider.Message{
-					Role: provider.RoleUser,
-					Text: decision.Correction,
+					Role:     provider.RoleUser,
+					Text:     decision.Correction,
+					Internal: true,
 				})
 				continue
 			}
@@ -288,8 +293,9 @@ func (l *Loop) Run(ctx context.Context, prompt string) (Result, error) {
 			result.Blocked++
 			l.session().ForcedTool = decision.ForceTool
 			l.messages = append(l.messages, provider.Message{
-				Role: provider.RoleUser,
-				Text: decision.Correction,
+				Role:     provider.RoleUser,
+				Text:     decision.Correction,
+				Internal: true,
 			})
 		}
 	}

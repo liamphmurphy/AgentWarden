@@ -19,6 +19,10 @@ const (
 type Message struct {
 	Role Role   `json:"role"`
 	Text string `json:"content"`
+	// Internal marks context written by the runtime rather than the user.
+	// It remains in provider requests, but transcript renderers must not
+	// attribute it to the person at the terminal.
+	Internal bool `json:"internal,omitempty"`
 
 	// ToolCalls is set on assistant messages that requested tool execution.
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
