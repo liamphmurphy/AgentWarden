@@ -8,7 +8,6 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -593,11 +592,9 @@ func runBatch(t *testing.T, cmd tea.Cmd) []tea.Cmd {
 	}
 }
 
-// ansiPattern matches terminal escape sequences.
-var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
-
 // stripANSI removes styling so an assertion tests content, not presentation.
-func stripANSI(s string) string { return ansiPattern.ReplaceAllString(s, "") }
+// It delegates to the package's own helper so there is one implementation.
+func stripANSI(s string) string { return plainText(s) }
 
 var _ tea.Model = (*Model)(nil)
 
@@ -1856,5 +1853,413 @@ func TestPaneGrowthTriggersRelayout(t *testing.T) {
 	// And the input must still be on screen.
 	if !strings.Contains(stripANSI(m.View()), "Ask anything") {
 		t.Error("the input should still be visible")
+	}
+}
+
+// captureClipboard replaces the clipboard writer and returns what was written.
+func captureClipboard(m *Model) *string {
+	var last string
+	m.writeClipboard = func(text string) error {
+		last = text
+		return nil
+	}
+	return &last
+}
+
+// fillTranscript adds enough entries to make the viewport scrollable.
+func fillTranscript(m *Model, n int) {
+	for i := range n {
+		m.transcript = append(m.transcript, fmt.Sprintf("entry %d", i))
+	}
+	m.refresh()
+}
+
+func TestFollowsNewestOutputByDefault(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	if !m.follow {
+		t.Fatal("a new session should follow the newest output")
+	}
+	fillTranscript(m, 100)
+	if !m.viewport.AtBottom() {
+		t.Error("following should keep the viewport at the bottom")
+	}
+}
+
+// TestScrollingUpStopsFollowing is the property that makes reading history
+// possible: streamed output must not yank you back to the bottom.
+func TestScrollingUpStopsFollowing(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	fillTranscript(m, 100)
+
+	m.Update(tea.KeyMsg{Type: tea.KeyShiftUp})
+	if m.follow {
+		t.Fatal("scrolling up should stop following")
+	}
+	offset := m.viewport.YOffset
+
+	// New output arrives; the view must stay where the reader put it.
+	m.Update(deltaMsg("a fresh token"))
+	if m.viewport.YOffset != offset {
+		t.Errorf("view jumped from %d to %d while scrolled back", offset, m.viewport.YOffset)
+	}
+	if m.viewport.AtBottom() {
+		t.Error("the view should still be scrolled back")
+	}
+}
+
+func TestEndResumesFollowing(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	fillTranscript(m, 100)
+	m.Update(tea.KeyMsg{Type: tea.KeyShiftUp})
+	if m.follow {
+		t.Fatal("precondition: should have stopped following")
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	if !m.follow {
+		t.Error("end should resume following")
+	}
+	if !m.viewport.AtBottom() {
+		t.Error("end should jump to the newest output")
+	}
+}
+
+func TestScrollKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		key  tea.KeyMsg
+		// wantUp is true when the key should move the view backwards.
+		wantUp bool
+	}{
+		{"pgup", tea.KeyMsg{Type: tea.KeyPgUp}, true},
+		{"shift+up", tea.KeyMsg{Type: tea.KeyShiftUp}, true},
+		{"home", tea.KeyMsg{Type: tea.KeyHome}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newModel(t, &stubRunner{})
+			fillTranscript(m, 200)
+			before := m.viewport.YOffset
+
+			m.Update(tc.key)
+			if tc.wantUp && m.viewport.YOffset >= before {
+				t.Errorf("%s should scroll back: %d -> %d", tc.name, before, m.viewport.YOffset)
+			}
+		})
+	}
+
+	// And forward again.
+	m := newModel(t, &stubRunner{})
+	fillTranscript(m, 200)
+	m.Update(tea.KeyMsg{Type: tea.KeyHome})
+	top := m.viewport.YOffset
+	for _, key := range []tea.KeyMsg{
+		{Type: tea.KeyPgDown},
+		{Type: tea.KeyShiftDown},
+	} {
+		m.Update(key)
+	}
+	if m.viewport.YOffset <= top {
+		t.Errorf("pgdown/shift+down should scroll forward from %d, got %d", top, m.viewport.YOffset)
+	}
+}
+
+// TestMouseWheelScrolls is what most people will reach for first.
+func TestMouseWheelScrolls(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	fillTranscript(m, 200)
+	before := m.viewport.YOffset
+
+	m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp, Action: tea.MouseActionPress})
+	if m.viewport.YOffset >= before {
+		t.Fatalf("wheel up should scroll back: %d -> %d", before, m.viewport.YOffset)
+	}
+	if m.follow {
+		t.Error("wheel up should stop following")
+	}
+
+	up := m.viewport.YOffset
+	m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown, Action: tea.MouseActionPress})
+	if m.viewport.YOffset <= up {
+		t.Errorf("wheel down should scroll forward: %d -> %d", up, m.viewport.YOffset)
+	}
+}
+
+// TestWheelScrollDoesNotToggleGates: the wheel must not be mistaken for a
+// click on the gate pane.
+func TestWheelScrollDoesNotToggleGates(t *testing.T) {
+	m, _ := newSwitchableModel(t, true, true)
+	m.Update(gateStartMsg{id: "unit"})
+	m.Update(gateOutputMsg{id: "unit", line: "detail"})
+	_ = m.View()
+
+	m.Update(tea.MouseMsg{
+		Button: tea.MouseButtonWheelUp, Action: tea.MouseActionPress,
+		Y: m.gateTop + 1,
+	})
+	if m.gates.Collapsed(0) {
+		t.Error("scrolling over the gate pane should not collapse a gate")
+	}
+}
+
+// TestMouseReleaseEnablesNativeSelection: capturing the mouse is what stops a
+// terminal drag-selecting, so it has to be releasable.
+func TestMouseReleaseEnablesNativeSelection(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	if !m.mouseCaptured {
+		t.Fatal("the mouse starts captured, for wheel and click support")
+	}
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	if m.mouseCaptured {
+		t.Error("ctrl+s should release the mouse")
+	}
+	if cmd == nil {
+		t.Fatal("releasing should emit a command telling the terminal")
+	}
+	// The command must be the disable message, or the terminal keeps sending.
+	if _, ok := cmd().(interface{}); !ok {
+		t.Error("expected a message from the disable command")
+	}
+	if !strings.Contains(strings.Join(m.transcript, "\n"), "drag to select") {
+		t.Errorf("the user should be told what changed: %v", m.transcript)
+	}
+	// It shows in the status bar, since behaviour has changed.
+	if !strings.Contains(stripANSI(m.statusBar()), "select") {
+		t.Error("released mouse should be visible in the status bar")
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	if !m.mouseCaptured {
+		t.Error("ctrl+s again should re-capture")
+	}
+}
+
+func TestCopyLastMessage(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	copied := captureClipboard(m)
+	m.Update(deltaMsg("an older reply"))
+	m.Update(doneMsg{})
+	m.Update(deltaMsg("the newest reply"))
+	m.Update(doneMsg{})
+
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlY})
+	if *copied != "the newest reply" {
+		t.Errorf("copied %q, want the newest reply", *copied)
+	}
+	if !strings.Contains(stripANSI(strings.Join(m.transcript, "\n")), "copied the last reply") {
+		t.Errorf("the copy should be confirmed: %v", m.transcript)
+	}
+}
+
+func TestCopyStripsStyling(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	copied := captureClipboard(m)
+	// The reply is glamour-rendered in the transcript, so what gets copied
+	// must be the text rather than the escape sequences.
+	m.Update(deltaMsg("# Heading\n\nSome **bold** text."))
+	m.Update(doneMsg{})
+
+	m.command("/copy")
+	if strings.Contains(*copied, "\x1b[") {
+		t.Errorf("copied text should carry no escape sequences: %q", *copied)
+	}
+	if !strings.Contains(*copied, "Heading") {
+		t.Errorf("copied %q, want the readable text", *copied)
+	}
+}
+
+func TestCopyAllTakesWholeTranscript(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	copied := captureClipboard(m)
+	m.transcript = []string{"first", "second", "third"}
+
+	m.command("/copy all")
+	for _, want := range []string{"first", "second", "third"} {
+		if !strings.Contains(*copied, want) {
+			t.Errorf("copied %q, want it to include %q", *copied, want)
+		}
+	}
+}
+
+func TestCopyIncludesStreamingReply(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	copied := captureClipboard(m)
+	m.Update(deltaMsg("a reply still arriving"))
+
+	m.command("/copy")
+	if *copied != "a reply still arriving" {
+		t.Errorf("copied %q, want the in-flight reply", *copied)
+	}
+}
+
+func TestCopyEmptyTranscriptIsReported(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	captureClipboard(m)
+	m.command("/copy")
+	if !strings.Contains(strings.Join(m.transcript, "\n"), "nothing to copy") {
+		t.Errorf("an empty copy should say so: %v", m.transcript)
+	}
+}
+
+// TestCopyFailureIsReported covers a headless machine with no clipboard tool.
+func TestCopyFailureIsReported(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.Update(deltaMsg("something"))
+	m.Update(doneMsg{})
+	m.writeClipboard = func(string) error { return errors.New("no clipboard utility found") }
+
+	m.command("/copy")
+	joined := strings.Join(m.transcript, "\n")
+	if !strings.Contains(joined, "could not copy") || !strings.Contains(joined, "no clipboard utility") {
+		t.Errorf("the failure should be surfaced: %v", m.transcript)
+	}
+}
+
+func TestScrolledIndicatorInStatusBar(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	fillTranscript(m, 200)
+	if strings.Contains(stripANSI(m.statusBar()), "scrolled") {
+		t.Error("a followed view should not advertise a scroll position")
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyHome})
+	if !strings.Contains(stripANSI(m.statusBar()), "scrolled") {
+		t.Errorf("a scrolled view should say so:\n%s", stripANSI(m.statusBar()))
+	}
+}
+
+func TestClearResumesFollowing(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	fillTranscript(m, 100)
+	m.Update(tea.KeyMsg{Type: tea.KeyHome})
+	m.command("/clear")
+	if !m.follow {
+		t.Error("clearing should resume following")
+	}
+}
+
+func TestHelpAdvertisesScrollAndCopy(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.command("/help")
+	help := stripANSI(strings.Join(m.transcript, "\n"))
+	for _, want := range []string{"/copy", "ctrl+y", "ctrl+s", "pgup", "shift+↑"} {
+		if !strings.Contains(help, want) {
+			t.Errorf("/help should mention %q:\n%s", want, help)
+		}
+	}
+}
+
+// TestCopyIgnoresUIChrome is a regression test for a real bug: copying twice
+// put "copied the last reply (19 lines)" on the clipboard, because the
+// confirmation note had become the last transcript entry.
+func TestCopyIgnoresUIChrome(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	copied := captureClipboard(m)
+
+	m.Update(deltaMsg("the actual reply"))
+	m.Update(doneMsg{})
+
+	m.command("/copy")
+	if *copied != "the actual reply" {
+		t.Fatalf("copied %q, want the reply", *copied)
+	}
+
+	// Copying again must still yield the reply, not the confirmation note.
+	m.command("/copy")
+	if *copied != "the actual reply" {
+		t.Errorf("copied %q on the second attempt, want the reply again", *copied)
+	}
+}
+
+// TestCopyIgnoresPromptsAndToolLines: only assistant replies are "the last
+// reply"; the prompt echo and tool markers are chrome.
+func TestCopyIgnoresPromptsAndToolLines(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	copied := captureClipboard(m)
+
+	m.Update(deltaMsg("a real reply"))
+	m.Update(doneMsg{})
+	// Chrome lands after the reply.
+	m.Update(toolMsg{name: "bash", finished: true})
+	m.Update(blockedMsg{reason: "some refusal"})
+
+	m.command("/copy")
+	if *copied != "a real reply" {
+		t.Errorf("copied %q, want the reply rather than the chrome", *copied)
+	}
+}
+
+func TestCopyAllStillIncludesEverything(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	copied := captureClipboard(m)
+
+	m.Update(deltaMsg("the reply"))
+	m.Update(doneMsg{})
+	m.Update(toolMsg{name: "bash", finished: true})
+
+	m.command("/copy all")
+	for _, want := range []string{"the reply", "bash"} {
+		if !strings.Contains(*copied, want) {
+			t.Errorf("copied %q, want it to include %q", *copied, want)
+		}
+	}
+}
+
+// TestActionFeedbackIsVisibleWhenScrolledBack is the other regression: a
+// confirmation appended while scrolled up landed off-screen, so the action
+// looked like it had done nothing.
+func TestActionFeedbackIsVisibleWhenScrolledBack(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	captureClipboard(m)
+	m.Update(deltaMsg("a reply"))
+	m.Update(doneMsg{})
+	fillTranscript(m, 200)
+
+	m.Update(tea.KeyMsg{Type: tea.KeyHome})
+	if m.follow {
+		t.Fatal("precondition: should be scrolled away from the bottom")
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlY})
+	if !m.follow {
+		t.Error("an action's confirmation must be brought into view")
+	}
+	if !m.viewport.AtBottom() {
+		t.Error("the view should have jumped to show the confirmation")
+	}
+}
+
+// TestStreamedOutputDoesNotJumpWhileScrolledBack is the opposite case: model
+// output must not drag the view around while history is being read.
+func TestStreamedOutputDoesNotJumpWhileScrolledBack(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	fillTranscript(m, 200)
+	m.Update(tea.KeyMsg{Type: tea.KeyHome})
+	offset := m.viewport.YOffset
+
+	for range 5 {
+		m.Update(deltaMsg("more streamed output\n"))
+	}
+	m.Update(toolMsg{name: "read", finished: true})
+
+	if m.viewport.YOffset != offset {
+		t.Errorf("view moved from %d to %d while reading back", offset, m.viewport.YOffset)
+	}
+	if m.follow {
+		t.Error("streamed output should not resume following")
+	}
+}
+
+func TestClearResetsLastReply(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	captureClipboard(m)
+	m.Update(deltaMsg("a reply"))
+	m.Update(doneMsg{})
+
+	m.command("/clear")
+	m.command("/copy")
+	if !strings.Contains(stripANSI(strings.Join(m.transcript, "\n")), "nothing to copy") {
+		t.Errorf("after clearing there is no reply to copy: %v", m.transcript)
 	}
 }

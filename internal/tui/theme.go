@@ -3,6 +3,7 @@ package tui
 
 import (
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/charmbracelet/glamour/styles"
@@ -108,3 +109,9 @@ const (
 	glyphFail    = "✗"
 	glyphPending = "·"
 )
+
+// ansiEscape matches terminal styling sequences.
+var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+
+// plainText strips styling so rendered output can be copied as text.
+func plainText(s string) string { return ansiEscape.ReplaceAllString(s, "") }

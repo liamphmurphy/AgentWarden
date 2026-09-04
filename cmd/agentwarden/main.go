@@ -150,6 +150,17 @@ type app struct {
 	policyAvailable bool
 	// loop is retained so a mode switch can swap its governor in place.
 	loop *agent.Loop
+	// reportState pushes workflow transitions to the UI, so the status bar
+	// does not keep showing the state the session started in.
+	reportState func(workflow.State)
+}
+
+// announceState tells the UI the current workflow state, if anything is
+// listening.
+func (a *app) announceState() {
+	if a.reportState != nil {
+		a.reportState(a.WorkflowState())
+	}
 }
 
 // GovernanceAvailable reports whether this session can be governed. It needs a
@@ -211,9 +222,11 @@ func (a *app) SetGoverned(on bool) error {
 		a.task = task
 		a.syncActor()
 		a.retargetSession(a.loop)
+		a.announceState()
 	}
 	a.syncActor()
 	a.retargetSession(a.loop)
+	a.announceState()
 	return nil
 }
 
@@ -417,12 +430,33 @@ func (a *app) syncActor() {
 	}
 	if agentID := a.policy.AgentFor(role); agentID != "" {
 		a.actor.AgentID = agentID
+		a.syncPermissions(agentID)
 		return
 	}
 	// With no role mapping configured, fall back to the selected agent.
 	if a.agentDef != nil {
 		a.actor.AgentID = a.agentDef.Name
+		a.syncPermissions(a.agentDef.Name)
 	}
+}
+
+// syncPermissions adopts the named agent's permission rules.
+//
+// Masking decides which tools the model can see; these rules decide whether a
+// visible tool may actually run. Both must follow the stage, or the workflow
+// becomes unsatisfiable: the implementing stage offers `edit`, and the
+// orchestrator's rules deny it.
+func (a *app) syncPermissions(agentID string) {
+	if a.perms == nil || a.agents == nil {
+		return
+	}
+	def, ok := a.agents.Get(agentID)
+	if !ok {
+		// No definition for the stage owner: leave the current rules rather
+		// than silently widening or narrowing them.
+		return
+	}
+	a.perms.SetRules(def.Permissions)
 }
 
 // newProviderClient builds the HTTP client for a configured provider. It is a
@@ -542,6 +576,7 @@ func (a *app) newLoop(observer agent.Observer, confirmer agent.Confirmer) *agent
 			a.task = task
 			a.syncActor()
 			a.retargetSession(loop)
+			a.announceState()
 		}
 	}
 	return loop
@@ -734,6 +769,8 @@ func (a *app) runTUI() error {
 		}
 	}
 
+	a.reportState = model.StateReporter()
+
 	loop := a.newLoop(model.Observer(), &tuiConfirmer{})
 	a.loop = loop
 	// Always the governed runner: it checks the live mode per run, so a switch
@@ -793,6 +830,7 @@ func (r *governedRunner) Run(ctx context.Context, prompt string) (agent.Result, 
 			r.loop.Task = outcome.Task
 			r.app.syncActor()
 			r.app.retargetSession(r.loop)
+			r.app.announceState()
 		}
 		if !r.app.policy.AutoAdvance() {
 			break

@@ -51,6 +51,17 @@ func NewPermissions(rules []Rule, auto bool) *Permissions {
 // SetAuto toggles auto-approval at runtime, backing the /auto TUI command.
 func (p *Permissions) SetAuto(auto bool) { p.auto = auto }
 
+// SetRules replaces the rule list, keeping the auto setting.
+//
+// A single interactive session performs each workflow stage in turn, so its
+// permissions have to follow the stage owner: otherwise the planner's
+// read-only rules would still be in force once the workflow reached
+// implementation, and the edit that stage exists to make would be denied.
+func (p *Permissions) SetRules(rules []Rule) { p.rules = rules }
+
+// Rules returns the active rule list.
+func (p *Permissions) Rules() []Rule { return append([]Rule(nil), p.rules...) }
+
 // Auto reports whether auto-approval is on.
 func (p *Permissions) Auto() bool { return p.auto }
 

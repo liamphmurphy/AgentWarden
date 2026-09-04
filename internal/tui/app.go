@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -43,6 +44,9 @@ type (
 	blockedMsg struct{ reason string }
 	// gateStartMsg reports a gate beginning.
 	gateStartMsg struct{ id string }
+	// stateMsg reports that the workflow advanced. Without it the status bar
+	// would keep showing the state the session started in.
+	stateMsg workflow.State
 	// gateOutputMsg carries one streamed output line from a gate.
 	gateOutputMsg struct {
 		id   string
@@ -113,6 +117,13 @@ type Model struct {
 	transcript []string
 	// streaming accumulates the in-flight assistant reply.
 	streaming strings.Builder
+	// lastReply is the plain text of the most recent assistant reply.
+	//
+	// It is tracked separately because the transcript also holds UI chrome:
+	// prompts, tool lines and the confirmations produced by commands. Copying
+	// "the last message" off the end of the transcript would otherwise copy
+	// the copy confirmation itself.
+	lastReply string
 	// activeTool is the tool currently executing, shown with a spinner.
 	activeTool string
 
@@ -142,6 +153,17 @@ type Model struct {
 	// ticking records whether a frame ticker is in flight, so the rate is not
 	// accidentally doubled by restarting an already-running one.
 	ticking bool
+	// follow keeps the viewport pinned to the newest output. It is cleared by
+	// scrolling up, so reading back through the transcript is not yanked to
+	// the bottom every time a token arrives.
+	follow bool
+	// writeClipboard is injected so tests can assert what would be copied
+	// without depending on a clipboard being present.
+	writeClipboard func(string) error
+	// mouseCaptured reports whether the program is grabbing mouse events.
+	// While it is, the terminal cannot do its own drag-selection, so this can
+	// be released to copy text the usual way.
+	mouseCaptured bool
 	// glamourStyle is the style name resolved before the program started.
 	// Rebuilding a renderer with WithAutoStyle would re-query the terminal
 	// mid-session and leak the reply into the input box.
@@ -188,22 +210,24 @@ func New(opts Options) *Model {
 	}
 
 	return &Model{
-		glamourStyle: style,
-		switcher:     opts.Switcher,
-		models:       opts.Models,
-		picker:       NewPicker(8),
-		history:      NewHistory(0),
-		runner:       opts.Runner,
-		events:       make(chan tea.Msg, 256),
-		viewport:     viewport.New(80, 20),
-		input:        input,
-		renderer:     renderer,
-		gates:        NewGatePane(opts.Gates),
-		Governed:     opts.Governed,
-		Auto:         opts.Auto,
-		ModelName:    opts.ModelName,
-		State:        opts.State,
-		showGates:    opts.Governed && len(opts.Gates) > 0,
+		glamourStyle:  style,
+		switcher:      opts.Switcher,
+		models:        opts.Models,
+		picker:        NewPicker(8),
+		follow:        true,
+		mouseCaptured: true,
+		history:       NewHistory(0),
+		runner:        opts.Runner,
+		events:        make(chan tea.Msg, 256),
+		viewport:      viewport.New(80, 20),
+		input:         input,
+		renderer:      renderer,
+		gates:         NewGatePane(opts.Gates),
+		Governed:      opts.Governed,
+		Auto:          opts.Auto,
+		ModelName:     opts.ModelName,
+		State:         opts.State,
+		showGates:     opts.Governed && len(opts.Gates) > 0,
 	}
 }
 
@@ -304,8 +328,12 @@ func (m *Model) recall(entry string) {
 }
 
 // note appends a styled one-line message to the transcript.
+//
+// It jumps to the bottom: notes only ever report the result of something the
+// user just did, and feedback you cannot see is no feedback at all.
 func (m *Model) note(style lipgloss.Style, text string) {
 	m.transcript = append(m.transcript, "  "+style.Render(text))
+	m.follow = true
 	m.refresh()
 }
 
@@ -362,6 +390,18 @@ func (m *Model) waitForEvent() tea.Cmd {
 
 // Observer returns an agent.Observer that feeds this model.
 func (m *Model) Observer() agent.Observer { return &observer{events: m.events} }
+
+// StateReporter returns a function that pushes workflow state changes into
+// the UI. The app calls it whenever the state machine advances.
+func (m *Model) StateReporter() func(workflow.State) {
+	return func(state workflow.State) {
+		select {
+		case m.events <- stateMsg(state):
+		default:
+			// Dropping a state frame is survivable: the next one corrects it.
+		}
+	}
+}
 
 // GateProgress returns an enforce.GateProgress that feeds this model.
 func (m *Model) GateProgress() enforce.GateProgress { return &gateProgress{events: m.events} }
@@ -423,6 +463,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// A gate may start after the ticker has gone idle.
 		return m, tea.Batch(m.waitForEvent(), m.resumeAnimation())
 
+	case stateMsg:
+		m.State = workflow.State(msg)
+		return m, m.waitForEvent()
+
 	case gateOutputMsg:
 		m.gates.Output(msg.id, msg.line)
 		// Expanded output changes the pane's height, so the layout has to be
@@ -444,6 +488,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if text := strings.TrimSpace(m.streaming.String()); text != "" {
 			m.transcript = append(m.transcript, m.render(text))
+			m.lastReply = text
 		}
 		m.streaming.Reset()
 		m.refresh()
@@ -455,8 +500,31 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// handleMouse resolves a click to a gate row and toggles it.
+// toggleMouse releases or regrabs mouse capture, returning the command that
+// tells the terminal.
+func (m *Model) toggleMouse() tea.Cmd {
+	m.mouseCaptured = !m.mouseCaptured
+	if m.mouseCaptured {
+		m.note(styleMuted, "mouse captured: wheel scrolls, click toggles gates")
+		return tea.EnableMouseCellMotion
+	}
+	m.note(styleOK, "mouse released: drag to select and copy, ctrl+s to re-capture")
+	return tea.DisableMouse
+}
+
+// handleMouse resolves wheel scrolling and clicks on the gate pane.
 func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	// The wheel scrolls the transcript wherever the pointer is: that is what
+	// every other scrollable pane in a terminal does.
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		m.scrollUp(3)
+		return m, nil
+	case tea.MouseButtonWheelDown:
+		m.scrollDown(3)
+		return m, nil
+	}
+
 	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
 		return m, nil
 	}
@@ -527,6 +595,45 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.showGates = !m.showGates
 		m.resize(m.width, m.height)
 		return m, nil
+
+	case "pgup":
+		m.viewport.ViewUp()
+		m.follow = m.viewport.AtBottom()
+		return m, nil
+
+	case "pgdown":
+		m.viewport.ViewDown()
+		m.follow = m.viewport.AtBottom()
+		return m, nil
+
+	case "shift+up":
+		m.scrollUp(1)
+		return m, nil
+
+	case "shift+down":
+		m.scrollDown(1)
+		return m, nil
+
+	case "home":
+		m.viewport.GotoTop()
+		m.follow = false
+		return m, nil
+
+	case "end":
+		m.viewport.GotoBottom()
+		m.follow = true
+		return m, nil
+
+	case "ctrl+y":
+		// Yank the newest reply, which is what one usually wants to keep.
+		m.copyToClipboard(m.lastReplyText(), "the last reply")
+		return m, nil
+
+	case "ctrl+s":
+		// Release or regrab the mouse. While the program captures it, the
+		// terminal cannot drag-select, so this is how text gets copied by
+		// hand.
+		return m, m.toggleMouse()
 
 	case "ctrl+o":
 		// Collapse or expand every gate at once.
@@ -631,7 +738,13 @@ func (m *Model) command(input string) (bool, tea.Cmd) {
 			"/gates    toggle the gate pane               (ctrl+w)",
 			"          tab selects a gate, space toggles it",
 			"          ctrl+o collapses or expands them all",
+			"/copy     copy the last reply                (ctrl+y)",
+			"/copy all copy the whole transcript",
+			"/mouse    release the mouse to select text   (ctrl+s)",
 			"/clear    clear the transcript",
+			"",
+			styleAccent.Render("Scrolling"),
+			"pgup/pgdn page · shift+↑/↓ line · home/end ends · wheel",
 			"/quit     exit",
 		}, "\n")))
 	case "/plain":
@@ -653,8 +766,20 @@ func (m *Model) command(input string) (bool, tea.Cmd) {
 			styleMuted.Render(fmt.Sprintf("  auto-approval %s", onOff(m.Auto))))
 	case "/gates":
 		m.showGates = !m.showGates
+	case "/copy":
+		// `/copy all` takes the whole conversation; bare `/copy` the last
+		// message, which is the common case.
+		if fields := strings.Fields(input); len(fields) > 1 && fields[1] == "all" {
+			m.copyToClipboard(m.transcriptText(), "the transcript")
+		} else {
+			m.copyToClipboard(m.lastReplyText(), "the last reply")
+		}
+	case "/mouse":
+		return true, m.toggleMouse()
 	case "/clear":
 		m.transcript = nil
+		m.lastReply = ""
+		m.follow = true
 	case "/quit", "/exit":
 		return true, tea.Quit
 	default:
@@ -737,14 +862,68 @@ func (m *Model) render(text string) string {
 	return strings.TrimRight(out, "\n")
 }
 
-// refresh rebuilds the viewport content and keeps it pinned to the bottom.
+// refresh rebuilds the viewport content, following the newest output only if
+// the reader has not scrolled away from it.
 func (m *Model) refresh() {
 	parts := append([]string(nil), m.transcript...)
 	if streaming := m.streaming.String(); streaming != "" {
 		parts = append(parts, m.render(streaming))
 	}
 	m.viewport.SetContent(strings.Join(parts, "\n"))
-	m.viewport.GotoBottom()
+	if m.follow {
+		m.viewport.GotoBottom()
+	}
+}
+
+// scrollUp moves the viewport back and stops following.
+func (m *Model) scrollUp(lines int) {
+	m.viewport.LineUp(lines)
+	m.follow = m.viewport.AtBottom()
+}
+
+// scrollDown moves the viewport forward, resuming following at the bottom.
+func (m *Model) scrollDown(lines int) {
+	m.viewport.LineDown(lines)
+	m.follow = m.viewport.AtBottom()
+}
+
+// transcriptText returns the conversation as plain text, with styling removed
+// so it pastes cleanly.
+func (m *Model) transcriptText() string {
+	parts := append([]string(nil), m.transcript...)
+	if streaming := m.streaming.String(); streaming != "" {
+		parts = append(parts, streaming)
+	}
+	return plainText(strings.Join(parts, "\n"))
+}
+
+// lastReplyText returns the most recent assistant reply as plain text,
+// preferring one still arriving.
+func (m *Model) lastReplyText() string {
+	if streaming := strings.TrimSpace(m.streaming.String()); streaming != "" {
+		return streaming
+	}
+	return m.lastReply
+}
+
+// copyToClipboard puts text on the system clipboard and reports the outcome.
+func (m *Model) copyToClipboard(text, what string) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		m.note(styleMuted, "nothing to copy")
+		return
+	}
+	write := m.writeClipboard
+	if write == nil {
+		write = clipboard.WriteAll
+	}
+	if err := write(trimmed); err != nil {
+		// Headless or no clipboard tool: say so rather than silently failing.
+		m.note(styleFail, "could not copy: "+err.Error())
+		return
+	}
+	m.note(styleOK, fmt.Sprintf("copied %s (%d lines)", what,
+		strings.Count(trimmed, "\n")+1))
 }
 
 // View renders the interface.
@@ -792,6 +971,16 @@ func (m *Model) statusBar() string {
 		left = append(left, styleAccent.Render(spinnerFrame(m.tick)+" "+m.activeTool))
 	case m.busy:
 		left = append(left, styleAccent.Render(spinnerFrame(m.tick)+" thinking"))
+	}
+
+	// Scrolled away from the newest output, or holding the mouse back: both
+	// change how the interface behaves, so both are shown.
+	if !m.follow {
+		left = append(left, styleWarn.Render(fmt.Sprintf("scrolled %d%%",
+			int(m.viewport.ScrollPercent()*100))))
+	}
+	if !m.mouseCaptured {
+		left = append(left, styleOK.Render("select"))
 	}
 
 	line := strings.Join(left, styleMuted.Render(" · "))
