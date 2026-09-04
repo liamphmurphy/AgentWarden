@@ -315,6 +315,36 @@ func TestBusyStatusShowsSpinner(t *testing.T) {
 	}
 }
 
+func TestToolCallShowsArgumentsAndFailureContent(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.Update(toolMsg{name: "bash", args: `{"command":"go test ./..."}`})
+	m.Update(toolMsg{name: "bash", finished: true, isError: true,
+		content: "FAIL: package api"})
+
+	view := stripANSI(m.transcript[0])
+	if !strings.Contains(view, `args: {"command":"go test ./..."}`) {
+		t.Errorf("tool arguments should be visible in the expanded row:\n%s", view)
+	}
+	if !strings.Contains(view, "FAIL: package api") {
+		t.Errorf("tool failure content should be visible in the expanded row:\n%s", view)
+	}
+}
+
+func TestToolCallClickCollapsesDetails(t *testing.T) {
+	m := newModel(t, &stubRunner{})
+	m.Update(toolMsg{name: "bash", args: `{"command":"false"}`})
+	m.Update(toolMsg{name: "bash", finished: true, isError: true, content: "command failed"})
+	_ = m.View()
+
+	m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, Y: 0})
+	if !m.toolCalls[0].Collapsed {
+		t.Fatal("clicking a tool row should collapse its details")
+	}
+	if got := stripANSI(m.transcript[0]); strings.Contains(got, "command failed") {
+		t.Errorf("collapsed tool details should be hidden:\n%s", got)
+	}
+}
+
 // TestPlainCommandNeedsASwitcher: without something able to disengage the
 // enforcer, /plain must refuse rather than relabel the status bar. That
 // mismatch was the original bug.
@@ -480,12 +510,19 @@ func TestDoneMovesStreamingIntoTranscript(t *testing.T) {
 func TestDoneRecordsError(t *testing.T) {
 	m := newModel(t, &stubRunner{})
 	m.busy = true
-	m.Update(doneMsg{err: errors.New("provider unreachable")})
+	fullError := "provider unreachable: http://127.0.0.1:11434/v1/chat/completions returned status 500: model overloaded"
+	m.Update(doneMsg{err: errors.New(fullError)})
 	if m.err == nil {
 		t.Fatal("the error should be recorded")
 	}
 	if !strings.Contains(m.statusBar(), "provider unreachable") {
 		t.Error("the error should be visible in the status bar")
+	}
+	got := stripANSI(strings.Join(m.transcript, "\n"))
+	for _, part := range []string{"provider unreachable: http://127.0.0.1:11434/v1/chat/completions", "returned status 500: model overloaded"} {
+		if !strings.Contains(got, part) {
+			t.Errorf("the complete error should be visible in the transcript, missing %q:\n%s", part, got)
+		}
 	}
 }
 

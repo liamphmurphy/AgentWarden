@@ -225,7 +225,7 @@ func (p *GatePane) GateAtRow(row int) int {
 }
 
 // View renders the pane. tick animates the spinner for running gates.
-func (p *GatePane) View(tick int) string {
+func (p *GatePane) View(tick int, dimensions ...int) string {
 	p.rowGate = nil
 	if len(p.gates) == 0 {
 		return ""
@@ -246,7 +246,20 @@ func (p *GatePane) View(tick int) string {
 			p.rowGate = append(p.rowGate, i)
 		}
 	}
-	return stylePane.Render(strings.Join(rows, "\n"))
+	content := strings.Join(rows, "\n")
+	if len(dimensions) > 1 && dimensions[1] >= 3 {
+		lines := strings.Split(content, "\n")
+		limit := dimensions[1] - 2
+		if len(lines) > limit {
+			lines = lines[:limit]
+		}
+		content = strings.Join(lines, "\n")
+	}
+	style := stylePane
+	if len(dimensions) > 0 && dimensions[0] > 0 {
+		style = style.Width(dimensions[0])
+	}
+	return style.Render(content)
 }
 
 // renderHeader draws one gate's status line.

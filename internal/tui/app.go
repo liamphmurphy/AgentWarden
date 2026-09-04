@@ -37,6 +37,8 @@ type (
 	// toolMsg reports a tool starting or finishing.
 	toolMsg struct {
 		name     string
+		args     string
+		content  string
 		finished bool
 		isError  bool
 	}
@@ -137,6 +139,12 @@ type Model struct {
 	lastReply string
 	// activeTool is the tool currently executing, shown with a spinner.
 	activeTool string
+	// toolCalls are the structured entries behind the transcript's tool rows.
+	// Keeping them structured lets a click collapse a row without losing the
+	// arguments and returned error that made the row useful in the first place.
+	toolCalls []toolCallView
+	// toolRows maps rendered viewport content rows to tool-call indexes.
+	toolRows []int
 
 	// tick counts animation frames, driving all spinners.
 	tick int
@@ -161,9 +169,11 @@ type Model struct {
 	showStatus bool
 	// gateTop is the absolute row where the gate pane starts, recorded on
 	// render so a mouse click can be mapped back to a gate row.
-	gateTop int
-	err     error
-	cancel  context.CancelFunc
+	gateTop   int
+	gateLeft  int
+	gateWidth int
+	err       error
+	cancel    context.CancelFunc
 
 	// ticking records whether a frame ticker is in flight, so the rate is not
 	// accidentally doubled by restarting an already-running one.
@@ -471,14 +481,30 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case toolMsg:
 		if msg.finished {
 			m.activeTool = ""
-			status := styleOK.Render(glyphPass)
-			if msg.isError {
-				status = styleFail.Render(glyphFail)
+			matched := false
+			for i := range m.toolCalls {
+				if m.toolCalls[i].Name == msg.name && m.toolCalls[i].Running {
+					matched = true
+					m.toolCalls[i].Running = false
+					m.toolCalls[i].IsError = msg.isError
+					m.toolCalls[i].Content = msg.content
+					m.transcript[m.toolCalls[i].TranscriptIndex] = m.renderToolCall(i)
+					break
+				}
 			}
-			m.transcript = append(m.transcript,
-				fmt.Sprintf("  %s %s", status, styleMuted.Render(msg.name)))
+			// Headless tests and alternate observers may report only the
+			// completion event. Preserve that useful result rather than
+			// dropping the tool row.
+			if !matched {
+				call := toolCallView{Name: msg.name, Content: msg.content, IsError: msg.isError, TranscriptIndex: len(m.transcript)}
+				m.toolCalls = append(m.toolCalls, call)
+				m.transcript = append(m.transcript, m.renderToolCall(len(m.toolCalls)-1))
+			}
 		} else {
 			m.activeTool = msg.name
+			call := toolCallView{Name: msg.name, Args: msg.args, Running: true, TranscriptIndex: len(m.transcript)}
+			m.toolCalls = append(m.toolCalls, call)
+			m.transcript = append(m.transcript, m.renderToolCall(len(m.toolCalls)-1))
 		}
 		m.refresh()
 		return m, m.waitForEvent()
@@ -529,6 +555,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cancel = nil
 		if msg.err != nil {
 			m.err = msg.err
+			m.transcript = append(m.transcript, m.renderError(msg.err))
 		}
 		if text := strings.TrimSpace(m.streaming.String()); text != "" {
 			m.transcript = append(m.transcript, m.render(text))
@@ -586,7 +613,10 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if !m.showGates {
-		return m, nil
+		return m, m.toggleToolAt(msg.X, msg.Y)
+	}
+	if msg.X > 0 && (msg.X < m.gateLeft || msg.X >= m.gateLeft+m.gateWidth) {
+		return m, m.toggleToolAt(msg.X, msg.Y)
 	}
 	// gateTop is the absolute row where the pane's border begins, recorded by
 	// the last View: a click arrives against what is currently on screen.
@@ -596,7 +626,28 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		m.gates.Toggle(index)
 		m.resize(m.width, m.height)
 	}
-	return m, nil
+	return m, m.toggleToolAt(msg.X, msg.Y)
+}
+
+// toggleToolAt collapses a tool row under the pointer. Tool rows live in the
+// scrollable transcript, so the viewport offset must be included.
+func (m *Model) toggleToolAt(x, y int) tea.Cmd {
+	if y < 0 {
+		return nil
+	}
+	if x > 0 && m.statusWidth() > 0 && x >= m.width-m.statusWidth() {
+		return nil
+	}
+	contentRow := m.viewport.YOffset + y
+	if contentRow < 0 || contentRow >= len(m.toolRows) {
+		return nil
+	}
+	if index := m.toolRows[contentRow]; index >= 0 {
+		m.toolCalls[index].Collapsed = !m.toolCalls[index].Collapsed
+		m.transcript[m.toolCalls[index].TranscriptIndex] = m.renderToolCall(index)
+		m.resize(m.width, m.height)
+	}
+	return nil
 }
 
 // handleKey processes key input.
@@ -889,13 +940,9 @@ func (m *Model) resize(width, height int) {
 	}
 	m.width, m.height = width, height
 
-	gateHeight := 0
-	if m.showGates {
-		gateHeight = lipglossHeight(m.gates.View(m.tick))
-	}
 	pickerHeight := lipglossHeight(m.picker.View(width))
 	// Reserve rows for the input, the status bar, the gate pane and the picker.
-	chrome := m.input.Height() + 2 + 1 + gateHeight + pickerHeight
+	chrome := m.input.Height() + 2 + 1 + m.gatePaneHeight(height) + pickerHeight
 	viewportHeight := height - chrome
 	if viewportHeight < 3 {
 		viewportHeight = 3
@@ -916,6 +963,18 @@ func (m *Model) resize(width, height int) {
 	m.refresh()
 }
 
+// gatePaneHeight is reserved inside the right rail, below the stats pane.
+func (m *Model) gatePaneHeight(height int) int {
+	if !m.showGates || m.statusWidth() == 0 {
+		return 0
+	}
+	available := height - m.input.Height() - 3
+	if available < 3 {
+		return 0
+	}
+	return minInt(lipglossHeight(m.gates.View(m.tick)), available/2)
+}
+
 // render turns markdown into styled text, falling back to plain text.
 func (m *Model) render(text string) string {
 	if m.renderer == nil {
@@ -928,10 +987,38 @@ func (m *Model) render(text string) string {
 	return strings.TrimRight(out, "\n")
 }
 
+// renderError keeps the complete runtime error in the scrollable transcript.
+// The status bar is intentionally a compact summary, so long provider URLs
+// and response bodies must have another home where lipgloss can wrap them.
+func (m *Model) renderError(err error) string {
+	width := m.viewport.Width
+	if width < 20 {
+		width = 80
+	}
+	return styleFail.Copy().Width(width).Render("  ⚠ " + err.Error())
+}
+
 // refresh rebuilds the viewport content, following the newest output only if
 // the reader has not scrolled away from it.
 func (m *Model) refresh() {
 	parts := append([]string(nil), m.transcript...)
+	m.toolRows = make([]int, 0)
+	for i, part := range parts {
+		lines := lipglossHeight(part)
+		toolIndex := -1
+		for j := range m.toolCalls {
+			if m.toolCalls[j].TranscriptIndex == i {
+				toolIndex = j
+				break
+			}
+		}
+		for row := 0; row < lines; row++ {
+			m.toolRows = append(m.toolRows, toolIndex)
+		}
+		if i < len(parts)-1 {
+			m.toolRows = append(m.toolRows, -1)
+		}
+	}
 	if streaming := m.streaming.String(); streaming != "" {
 		parts = append(parts, m.render(streaming))
 	}
@@ -1008,18 +1095,27 @@ func (m *Model) statusView() string {
 	if m.statusWidth() == 0 {
 		return ""
 	}
-	return m.status.View(m.width, m.viewport.Height)
+	return m.status.View(m.width, m.railStatusHeight())
+}
+
+func (m *Model) railStatusHeight() int {
+	available := m.height - m.input.Height() - 3 - lipglossHeight(m.picker.View(m.width))
+	gateHeight := m.gatePaneHeight(m.height)
+	if available-gateHeight < 4 {
+		return available
+	}
+	return available - gateHeight
 }
 
 // View renders the interface.
 func (m *Model) View() string {
 	var b strings.Builder
 
-	// The transcript and the status panel share a row; everything below is
-	// full width.
+	// The transcript and the stacked right rail share a row; everything below
+	// is full width.
 	main := m.viewport.View()
-	if pane := m.statusView(); pane != "" {
-		main = lipgloss.JoinHorizontal(lipgloss.Top, main, pane)
+	if rail := m.rightRail(); rail != "" {
+		main = lipgloss.JoinHorizontal(lipgloss.Top, main, rail)
 	}
 	b.WriteString(main)
 	b.WriteString("\n")
@@ -1029,26 +1125,33 @@ func (m *Model) View() string {
 		b.WriteString("\n")
 	}
 
-	if m.showGates {
-		if pane := m.gates.View(m.tick); pane != "" {
-			// gateTop is the pane's border row, so it is the count of rows
-			// already written: a block of n rows occupies 0..n-1, putting
-			// the next block at n. The transcript row is measured after the
-			// join, since the side panel can make it taller than the
-			// viewport.
-			m.gateTop = lipglossHeight(main)
-			if picker := m.picker.View(m.width); picker != "" {
-				m.gateTop += lipglossHeight(picker)
-			}
-			b.WriteString(pane)
-			b.WriteString("\n")
-		}
-	}
-
 	b.WriteString(m.input.View())
 	b.WriteString("\n")
 	b.WriteString(m.statusBar())
 	return b.String()
+}
+
+// rightRail stacks independent floating panes at the right edge. The gate
+// pane intentionally shares the stats pane's width but never changes its
+// content or accounting.
+func (m *Model) rightRail() string {
+	if m.statusWidth() == 0 {
+		return ""
+	}
+	status := m.statusView()
+	gate := ""
+	if m.showGates && m.gatePaneHeight(m.height) > 0 {
+		gate = m.gates.View(m.tick, m.statusWidth()-2, m.gatePaneHeight(m.height))
+	}
+	if gate == "" {
+		return status
+	}
+	rail := lipgloss.JoinVertical(lipgloss.Left, status, gate)
+	// Record the gate's absolute location for click mapping.
+	m.gateTop = lipglossHeight(status)
+	m.gateLeft = m.width - m.statusWidth()
+	m.gateWidth = m.statusWidth()
+	return rail
 }
 
 // statusBar renders the bottom line: what model is in use, which mode is
@@ -1140,11 +1243,11 @@ type observer struct{ events chan tea.Msg }
 func (o *observer) TextDelta(text string) { o.send(deltaMsg(text)) }
 
 func (o *observer) ToolStarted(call tool.Call) {
-	o.send(toolMsg{name: call.Name})
+	o.send(toolMsg{name: call.Name, args: call.Args})
 }
 
 func (o *observer) ToolFinished(call tool.Call, result tool.Result) {
-	o.send(toolMsg{name: call.Name, finished: true, isError: result.IsError})
+	o.send(toolMsg{name: call.Name, content: result.Content, finished: true, isError: result.IsError})
 }
 
 func (o *observer) Blocked(_ tool.Call, decision enforce.Decision) {
