@@ -54,6 +54,11 @@ type (
 	}
 	// gateDoneMsg reports a gate receipt.
 	gateDoneMsg struct{ receipt workflow.Receipt }
+	// usageMsg reports the token accounting for one completed model turn.
+	usageMsg struct {
+		prompt     int
+		completion int
+	}
 	// doneMsg reports the loop finishing a run.
 	doneMsg struct {
 		result agent.Result
@@ -81,6 +86,11 @@ type ModelSwitcher interface {
 	CurrentModel() string
 	// SetModel switches the session to a reference.
 	SetModel(ref string) error
+	// ContextWindow reports the active model's window in tokens, or 0 when
+	// the config does not declare one. It is per-model rather than
+	// per-session because switching model changes how full the same
+	// conversation is.
+	ContextWindow() int
 }
 
 // ModeSwitcher swaps governance on and off for a live session.
@@ -112,6 +122,7 @@ type Model struct {
 	input    textarea.Model
 	renderer *glamour.TermRenderer
 	gates    *GatePane
+	status   *StatusPane
 
 	// transcript holds completed exchanges as rendered text.
 	transcript []string
@@ -144,6 +155,10 @@ type Model struct {
 	State workflow.State
 
 	showGates bool
+	// showStatus controls the right-hand panel. It starts on: token spend and
+	// context pressure are the things a session silently accumulates, so they
+	// are shown until asked otherwise.
+	showStatus bool
 	// gateTop is the absolute row where the gate pane starts, recorded on
 	// render so a mouse click can be mapped back to a gate row.
 	gateTop int
@@ -180,6 +195,11 @@ type Options struct {
 	Auto      bool
 	ModelName string
 	State     workflow.State
+	// Stages is the workflow spine shown in the status panel, in order. Empty
+	// leaves the panel showing the bare state name.
+	Stages []Stage
+	// ContextWindow is the starting model's window in tokens, 0 when unknown.
+	ContextWindow int
 	// GlamourStyle is the style name resolved by DetectTheme before the
 	// program starts. Empty falls back to a fixed dark style; it must never
 	// be auto-detected here, because resize rebuilds the renderer while
@@ -210,7 +230,14 @@ func New(opts Options) *Model {
 	}
 
 	return &Model{
-		glamourStyle:  style,
+		glamourStyle: style,
+		showStatus:   true,
+		status: &StatusPane{
+			Stages:        opts.Stages,
+			State:         opts.State,
+			Governed:      opts.Governed,
+			ContextWindow: opts.ContextWindow,
+		},
 		switcher:      opts.Switcher,
 		models:        opts.Models,
 		picker:        NewPicker(8),
@@ -277,6 +304,9 @@ func (m *Model) applyModel(ref string) {
 		return
 	}
 	m.ModelName = ref
+	// The window belongs to the model, so the same conversation is a
+	// different fraction of it after a switch.
+	m.status.ContextWindow = m.models.ContextWindow()
 	m.note(styleOK, "model: "+ref)
 }
 
@@ -311,6 +341,8 @@ func (m *Model) setGoverned(on bool) {
 
 	m.Governed = on
 	m.State = m.switcher.WorkflowState()
+	m.status.Governed = on
+	m.status.State = m.State
 	m.showGates = on && len(m.gates.gates) > 0
 	if on {
 		m.note(styleOK, fmt.Sprintf("governed: gates enforced, state %s", m.State))
@@ -465,6 +497,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case stateMsg:
 		m.State = workflow.State(msg)
+		m.status.State = m.State
+		return m, m.waitForEvent()
+
+	case usageMsg:
+		m.status.Usage.Reported = true
+		m.status.Usage.Turns++
+		m.status.Usage.Sent += msg.prompt
+		m.status.Usage.Received += msg.completion
+		// Only the newest prompt measures context pressure: every turn
+		// resends the conversation, so accumulating prompts would report a
+		// window many times overflowed.
+		m.status.Usage.Prompt = msg.prompt
 		return m, m.waitForEvent()
 
 	case gateOutputMsg:
@@ -510,6 +554,19 @@ func (m *Model) toggleMouse() tea.Cmd {
 	}
 	m.note(styleOK, "mouse released: drag to select and copy, ctrl+s to re-capture")
 	return tea.DisableMouse
+}
+
+// toggleStatus shows or hides the side panel, reflowing the transcript into
+// the width the panel gives up.
+func (m *Model) toggleStatus() {
+	m.showStatus = !m.showStatus
+	// Turning it on in a narrow terminal changes nothing on screen, so say
+	// why rather than appearing to swallow the key.
+	if m.showStatus && m.width > 0 && m.width < minWidthForStatusPane {
+		m.note(styleMuted, fmt.Sprintf("the panel needs at least %d columns; this terminal has %d",
+			minWidthForStatusPane, m.width))
+	}
+	m.resize(m.width, m.height)
 }
 
 // handleMouse resolves wheel scrolling and clicks on the gate pane.
@@ -594,6 +651,12 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+w":
 		m.showGates = !m.showGates
 		m.resize(m.width, m.height)
+		return m, nil
+
+	case "ctrl+t":
+		// Hide or show the side panel. Reclaiming the column matters when
+		// reading wide output such as a diff.
+		m.toggleStatus()
 		return m, nil
 
 	case "pgup":
@@ -736,6 +799,7 @@ func (m *Model) command(input string) (bool, tea.Cmd) {
 			"/plain    drop governance, for quick questions",
 			"/auto     toggle auto-approval of tool calls",
 			"/gates    toggle the gate pane               (ctrl+w)",
+			"/stats    toggle the stage / token panel     (ctrl+t)",
 			"          tab selects a gate, space toggles it",
 			"          ctrl+o collapses or expands them all",
 			"/copy     copy the last reply                (ctrl+y)",
@@ -766,6 +830,8 @@ func (m *Model) command(input string) (bool, tea.Cmd) {
 			styleMuted.Render(fmt.Sprintf("  auto-approval %s", onOff(m.Auto))))
 	case "/gates":
 		m.showGates = !m.showGates
+	case "/stats", "/status":
+		m.toggleStatus()
 	case "/copy":
 		// `/copy all` takes the whole conversation; bare `/copy` the last
 		// message, which is the common case.
@@ -834,12 +900,12 @@ func (m *Model) resize(width, height int) {
 	if viewportHeight < 3 {
 		viewportHeight = 3
 	}
-	m.viewport.Width = width
+	m.viewport.Width = width - m.statusWidth()
 	m.viewport.Height = viewportHeight
 	m.input.SetWidth(width - 2)
 
 	if m.renderer != nil {
-		wrap := width - 4
+		wrap := m.viewport.Width - 4
 		if wrap < 20 {
 			wrap = 20
 		}
@@ -926,10 +992,36 @@ func (m *Model) copyToClipboard(text, what string) {
 		strings.Count(trimmed, "\n")+1))
 }
 
+// statusWidth is the columns the side panel occupies, zero when it is not
+// shown. resize needs this before View runs, so the decision lives here
+// rather than being inferred from a rendered pane.
+func (m *Model) statusWidth() int {
+	if !m.showStatus || m.width < minWidthForStatusPane {
+		return 0
+	}
+	return statusPaneWidth
+}
+
+// statusView renders the side panel, capped to the transcript's height so a
+// tall panel cannot push the input box off the screen.
+func (m *Model) statusView() string {
+	if m.statusWidth() == 0 {
+		return ""
+	}
+	return m.status.View(m.width, m.viewport.Height)
+}
+
 // View renders the interface.
 func (m *Model) View() string {
 	var b strings.Builder
-	b.WriteString(m.viewport.View())
+
+	// The transcript and the status panel share a row; everything below is
+	// full width.
+	main := m.viewport.View()
+	if pane := m.statusView(); pane != "" {
+		main = lipgloss.JoinHorizontal(lipgloss.Top, main, pane)
+	}
+	b.WriteString(main)
 	b.WriteString("\n")
 
 	if pane := m.picker.View(m.width); pane != "" {
@@ -939,11 +1031,14 @@ func (m *Model) View() string {
 
 	if m.showGates {
 		if pane := m.gates.View(m.tick); pane != "" {
-			// Rows consumed so far are the viewport plus the picker, each
-			// followed by a newline.
-			m.gateTop = lipglossHeight(m.viewport.View()) + 1
+			// gateTop is the pane's border row, so it is the count of rows
+			// already written: a block of n rows occupies 0..n-1, putting
+			// the next block at n. The transcript row is measured after the
+			// join, since the side panel can make it taller than the
+			// viewport.
+			m.gateTop = lipglossHeight(main)
 			if picker := m.picker.View(m.width); picker != "" {
-				m.gateTop += lipglossHeight(picker) + 1
+				m.gateTop += lipglossHeight(picker)
 			}
 			b.WriteString(pane)
 			b.WriteString("\n")
@@ -1056,7 +1151,15 @@ func (o *observer) Blocked(_ tool.Call, decision enforce.Decision) {
 	o.send(blockedMsg{reason: decision.Reason})
 }
 
-func (o *observer) TurnFinished(*provider.Usage) {}
+func (o *observer) TurnFinished(usage *provider.Usage) {
+	if usage == nil {
+		// Not every endpoint reports usage on a streamed response. Leaving
+		// the counters untouched keeps the panel saying "not reported"
+		// instead of claiming the turn was free.
+		return
+	}
+	o.send(usageMsg{prompt: usage.PromptTokens, completion: usage.CompletionTokens})
+}
 
 // send never blocks the loop: a full channel drops a progress frame rather
 // than stalling the model.

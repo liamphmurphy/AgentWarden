@@ -581,3 +581,84 @@ func TestNameFallsBackToID(t *testing.T) {
 }
 
 var _ provider.Provider = (*Client)(nil)
+
+// A streamed response carries no usage unless it is requested, and the status
+// panel reports token spend and context pressure from it.
+func TestStreamRequestsUsage(t *testing.T) {
+	srv, captured := sseServer(t, []string{"data: [DONE]\n\n"})
+	stream, err := newTestClient(t, srv.URL).Stream(context.Background(),
+		provider.Request{Model: "m"})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	stream.Close()
+
+	var body map[string]any
+	if err := json.Unmarshal(*captured, &body); err != nil {
+		t.Fatalf("captured body: %v", err)
+	}
+	opts, ok := body["stream_options"].(map[string]any)
+	if !ok {
+		t.Fatalf("stream_options = %#v, want an object", body["stream_options"])
+	}
+	if opts["include_usage"] != true {
+		t.Errorf("include_usage = %v, want true", opts["include_usage"])
+	}
+}
+
+// An endpoint that rejects an unknown field cannot be satisfied by sending
+// false, so a null in "extra" must remove the key altogether.
+func TestExtraNullRemovesDefault(t *testing.T) {
+	srv, captured := sseServer(t, []string{"data: [DONE]\n\n"})
+	client := New(Options{
+		ID:      "test",
+		BaseURL: srv.URL,
+		HTTP:    &http.Client{},
+		Extra:   map[string]any{"stream_options": nil},
+	})
+	stream, err := client.Stream(context.Background(), provider.Request{Model: "m"})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	stream.Close()
+
+	var body map[string]any
+	if err := json.Unmarshal(*captured, &body); err != nil {
+		t.Fatalf("captured body: %v", err)
+	}
+	if _, present := body["stream_options"]; present {
+		t.Errorf("stream_options survived a null override: %#v", body["stream_options"])
+	}
+	// The removal must not take the rest of the request with it.
+	if body["model"] != "m" {
+		t.Errorf("model = %v, want m", body["model"])
+	}
+}
+
+// A per-request null removes a provider-level default too, since the request
+// is merged last.
+func TestRequestExtraNullRemovesProviderExtra(t *testing.T) {
+	srv, captured := sseServer(t, []string{"data: [DONE]\n\n"})
+	client := New(Options{
+		ID:      "test",
+		BaseURL: srv.URL,
+		HTTP:    &http.Client{},
+		Extra:   map[string]any{"guided_json": map[string]any{"type": "object"}},
+	})
+	stream, err := client.Stream(context.Background(), provider.Request{
+		Model: "m",
+		Extra: map[string]any{"guided_json": nil},
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	stream.Close()
+
+	var body map[string]any
+	if err := json.Unmarshal(*captured, &body); err != nil {
+		t.Fatalf("captured body: %v", err)
+	}
+	if _, present := body["guided_json"]; present {
+		t.Errorf("guided_json survived a null override")
+	}
+}

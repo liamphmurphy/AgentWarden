@@ -948,6 +948,8 @@ type fakeModels struct {
 	current string
 	calls   []string
 	err     error
+	// windows maps a reference to its declared context window.
+	windows map[string]int
 }
 
 func (f *fakeModels) ModelRefs() []string { return f.refs }
@@ -955,6 +957,8 @@ func (f *fakeModels) ModelRefs() []string { return f.refs }
 func (f *fakeModels) DescribeModel(ref string) string { return "desc:" + ref }
 
 func (f *fakeModels) CurrentModel() string { return f.current }
+
+func (f *fakeModels) ContextWindow() int { return f.windows[f.current] }
 
 func (f *fakeModels) SetModel(ref string) error {
 	f.calls = append(f.calls, ref)

@@ -487,6 +487,21 @@ func (a *app) DescribeModel(ref string) string { return a.cfg.DescribeModel(ref)
 // CurrentModel returns the active reference.
 func (a *app) CurrentModel() string { return a.modelRef }
 
+// ContextWindow reports the active model's declared context window, or 0 when
+// the config does not declare one.
+//
+// It is only ever a declaration: an OpenAI-compatible endpoint reports how
+// many tokens a request used but not how many it would accept, so the window
+// has to come from config. Returning 0 rather than a guess keeps the panel
+// honest about which of the two it is showing.
+func (a *app) ContextWindow() int {
+	_, model, err := a.cfg.ResolveModel(a.modelRef)
+	if err != nil {
+		return 0
+	}
+	return model.ContextWindow
+}
+
 // SetModel switches the live session to another provider and model.
 //
 // The client is rebuilt and swapped onto the loop, so the change takes effect
@@ -743,14 +758,16 @@ func (a *app) runTUI() error {
 	glamourStyle := tui.DetectTheme()
 
 	model := tui.New(tui.Options{
-		GlamourStyle: glamourStyle,
-		Switcher:     a,
-		Models:       a,
-		Gates:        gates,
-		Governed:     a.governed,
-		Auto:         a.cfg.Auto,
-		ModelName:    a.modelRef,
-		State:        a.WorkflowState(),
+		GlamourStyle:  glamourStyle,
+		Switcher:      a,
+		Models:        a,
+		Gates:         gates,
+		Governed:      a.governed,
+		Auto:          a.cfg.Auto,
+		ModelName:     a.modelRef,
+		State:         a.WorkflowState(),
+		Stages:        a.stages(),
+		ContextWindow: a.ContextWindow(),
 	})
 
 	// Rebuild the controller so gate progress reports into the UI: a long
@@ -782,6 +799,28 @@ func (a *app) runTUI() error {
 	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err := program.Run()
 	return err
+}
+
+// stages resolves the workflow spine for the status panel, naming the agent
+// that owns each stage.
+//
+// The spine is derived from the policy's own transition graph rather than
+// hardcoded, so a project that declares custom states sees its own stages. It
+// is empty when no policy loaded, which is what makes the panel drop the
+// section instead of drawing a workflow that is not in force.
+func (a *app) stages() []tui.Stage {
+	if !a.policyAvailable || a.policy == nil {
+		return nil
+	}
+	var out []tui.Stage
+	for _, state := range workflow.Pipeline(a.policy.Transitions()) {
+		stage := tui.Stage{State: state}
+		if role := enforce.RoleForState(state); role != "" {
+			stage.Agent = a.policy.AgentFor(role)
+		}
+		out = append(out, stage)
+	}
+	return out
 }
 
 // tuiConfirmer approves in the TUI. Interactive confirmation prompts are a

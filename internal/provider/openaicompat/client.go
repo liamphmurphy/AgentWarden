@@ -135,6 +135,11 @@ func (c *Client) buildBody(req provider.Request) (map[string]any, error) {
 		"model":    req.Model,
 		"messages": messages,
 		"stream":   true,
+		// A streamed response carries no usage unless it is asked for, and
+		// the interface reports token spend and context pressure from it. An
+		// endpoint that rejects the field outright can drop it with
+		// "stream_options": null under its "extra" config.
+		"stream_options": map[string]any{"include_usage": true},
 	}
 
 	if len(req.Tools) > 0 {
@@ -176,13 +181,24 @@ func (c *Client) buildBody(req provider.Request) (map[string]any, error) {
 	if req.MaxTokens != nil {
 		body["max_tokens"] = *req.MaxTokens
 	}
-	for k, v := range c.extra {
-		body[k] = v
-	}
-	for k, v := range req.Extra {
-		body[k] = v
-	}
+	mergeExtra(body, c.extra)
+	mergeExtra(body, req.Extra)
 	return body, nil
+}
+
+// mergeExtra folds endpoint-specific knobs into a request body.
+//
+// An explicit null removes the key instead of sending null. That is the only
+// way to satisfy an endpoint which rejects an unknown field rather than
+// ignoring it, since a value of false still sends the field.
+func mergeExtra(body map[string]any, extra map[string]any) {
+	for k, v := range extra {
+		if v == nil {
+			delete(body, k)
+			continue
+		}
+		body[k] = v
+	}
 }
 
 // Stream issues the request and returns its event stream.
