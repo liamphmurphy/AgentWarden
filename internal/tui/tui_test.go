@@ -15,6 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/lmurphy/agentwarden/internal/agent"
 	"github.com/lmurphy/agentwarden/internal/enforce"
+	"github.com/lmurphy/agentwarden/internal/provider"
 	"github.com/lmurphy/agentwarden/internal/tool"
 	"github.com/lmurphy/agentwarden/internal/workflow"
 )
@@ -445,6 +446,26 @@ func TestCtrlCCancelsRunWhenBusy(t *testing.T) {
 	}
 	if cmd != nil {
 		t.Error("ctrl+c while busy should not quit")
+	}
+}
+
+func TestNewRestoresConversationTranscript(t *testing.T) {
+	m := New(Options{
+		Messages: []provider.Message{
+			{Role: provider.RoleSystem, Text: "system instructions"},
+			{Role: provider.RoleUser, Text: "inspect the service"},
+			{Role: provider.RoleAssistant, Text: "I found the handler."},
+		},
+	})
+
+	if len(m.transcript) != 2 {
+		t.Fatalf("New restored %d transcript entries, want 2", len(m.transcript))
+	}
+	if !strings.Contains(stripANSI(strings.Join(m.transcript, "\n")), "inspect the service") {
+		t.Error("restored transcript is missing the user message")
+	}
+	if !strings.Contains(stripANSI(strings.Join(m.transcript, "\n")), "I found the handler.") {
+		t.Error("restored transcript is missing the assistant message")
 	}
 }
 

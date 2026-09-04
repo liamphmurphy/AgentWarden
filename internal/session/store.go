@@ -10,13 +10,15 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/lmurphy/agentwarden/internal/provider"
 	"github.com/lmurphy/agentwarden/internal/workflow"
 )
 
 // Layout under the state directory.
 const (
-	tasksDir  = "tasks"
-	eventsDir = "events"
+	tasksDir    = "tasks"
+	eventsDir   = "events"
+	messagesDir = "messages"
 )
 
 // Store persists tasks as JSON and their audit history as append-only JSONL.
@@ -54,6 +56,10 @@ func (s *Store) taskPath(taskID string) string {
 
 func (s *Store) eventsPath(taskID string) string {
 	return filepath.Join(s.root, eventsDir, taskID+".jsonl")
+}
+
+func (s *Store) messagesPath(taskID string) string {
+	return filepath.Join(s.root, messagesDir, taskID+".json")
 }
 
 // ErrNotFound is returned when a task does not exist.
@@ -102,6 +108,45 @@ func (s *Store) Load(taskID string) (*workflow.Task, error) {
 		task.Receipts = map[string]workflow.Receipt{}
 	}
 	return &task, nil
+}
+
+// SaveMessages persists the conversation checkpoint for a task atomically.
+// It is separate from workflow.Task because provider messages are runtime
+// data, not part of the pure workflow domain.
+func (s *Store) SaveMessages(taskID string, messages []provider.Message) error {
+	path := s.messagesPath(taskID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create message dir: %w", err)
+	}
+	raw, err := json.MarshalIndent(messages, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal messages: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return fmt.Errorf("write messages: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("commit messages: %w", err)
+	}
+	return nil
+}
+
+// LoadMessages reads a saved conversation, returning an empty conversation
+// when the task predates conversation persistence.
+func (s *Store) LoadMessages(taskID string) ([]provider.Message, error) {
+	raw, err := os.ReadFile(s.messagesPath(taskID))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read messages: %w", err)
+	}
+	var messages []provider.Message
+	if err := json.Unmarshal(raw, &messages); err != nil {
+		return nil, fmt.Errorf("parse messages for %s: %w", taskID, err)
+	}
+	return messages, nil
 }
 
 // List returns every task ID, sorted.

@@ -38,16 +38,18 @@ type options struct {
 	model string
 	// inspectOnly suppresses side effects such as starting a task, so
 	// `-config` can report the setup without altering it.
-	inspectOnly bool
-	agentName   string
-	noWorkflow  bool
-	auto        bool
-	logRequests string
-	objective   string
-	showConfig  bool
-	listTasks   bool
-	cancelTask  string
-	resumeTask  string
+	inspectOnly   bool
+	agentName     string
+	noWorkflow    bool
+	auto          bool
+	logRequests   string
+	objective     string
+	showConfig    bool
+	listTasks     bool
+	cancelTask    string
+	resumeTask    string
+	resumeSession string
+	resumePicker  bool
 }
 
 func main() {
@@ -63,6 +65,7 @@ func usage() {
 Usage:
   agentwarden [flags]                 start the interactive TUI
   agentwarden run [flags] "<prompt>"  run one prompt and print the answer
+  agentwarden resume [session-id]     list or continue a previous session
 
 Flags:
   -model string      provider/model to use (overrides config)
@@ -76,6 +79,10 @@ Flags:
   -cancel id         cancel a governed task and exit
   -resume id         resume a blocked governed task and exit
 
+Commands:
+  resume              list previous governed sessions in this project
+  resume <session-id> continue a session at its persisted workflow stage
+
 Governance is on only when the config enables it and a policy file exists.
 `)
 }
@@ -86,8 +93,12 @@ func run() error {
 	// `agentwarden run "prompt"` is a subcommand; everything else is the TUI.
 	args := os.Args[1:]
 	oneShot := false
+	resumeCommand := false
 	if len(args) > 0 && args[0] == "run" {
 		oneShot = true
+		args = args[1:]
+	} else if len(args) > 0 && args[0] == "resume" {
+		resumeCommand = true
 		args = args[1:]
 	}
 
@@ -107,12 +118,35 @@ func run() error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if resumeCommand {
+		if len(fs.Args()) > 1 {
+			return errors.New("`agentwarden resume` accepts at most one session id")
+		}
+		if len(fs.Args()) == 1 {
+			opts.resumeSession = fs.Args()[0]
+		} else {
+			opts.resumePicker = true
+		}
+	}
 	prompt := strings.Join(fs.Args(), " ")
+	if opts.resumePicker {
+		project, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("locate working directory: %w", err)
+		}
+		opts.resumeSession, err = chooseSession(project)
+		if err != nil {
+			return err
+		}
+		if opts.resumeSession == "" {
+			return nil
+		}
+	}
 
 	// Every one of these inspects or repairs existing state, so none of them
 	// may start a task of its own on the way in.
 	opts.inspectOnly = opts.showConfig || opts.listTasks ||
-		opts.cancelTask != "" || opts.resumeTask != ""
+		opts.cancelTask != "" || opts.resumeTask != "" || opts.resumeSession != ""
 
 	app, err := build(opts)
 	if err != nil {
@@ -132,6 +166,9 @@ func run() error {
 	if opts.resumeTask != "" {
 		return app.resumeTask(opts.resumeTask)
 	}
+	if opts.resumeSession != "" {
+		return app.runTUI()
+	}
 	if oneShot {
 		if prompt == "" {
 			return errors.New("`agentwarden run` needs a prompt")
@@ -143,24 +180,25 @@ func run() error {
 
 // app holds everything a session needs.
 type app struct {
-	cfg      *config.Config
-	project  string
-	governed bool
-	policy   *workflow.Policy
-	ctl      *controller.Controller
-	tools    *tool.Registry
-	governor enforce.Governor
-	perms    *enforce.Permissions
-	provider provider.Provider
-	modelID  string
-	modelRef string
-	agentDef *agent.Definition
-	task     *workflow.Task
-	gateRun  *enforce.GateRunner
-	logFile  *os.File
-	actor    *controller.Actor
-	skills   *skill.Set
-	agents   *agent.Registry
+	cfg          *config.Config
+	project      string
+	governed     bool
+	policy       *workflow.Policy
+	ctl          *controller.Controller
+	tools        *tool.Registry
+	governor     enforce.Governor
+	perms        *enforce.Permissions
+	provider     provider.Provider
+	modelID      string
+	modelRef     string
+	agentDef     *agent.Definition
+	task         *workflow.Task
+	conversation []provider.Message
+	gateRun      *enforce.GateRunner
+	logFile      *os.File
+	actor        *controller.Actor
+	skills       *skill.Set
+	agents       *agent.Registry
 	// agentExplicit records that the user named the agent with -agent, which
 	// is honoured in plain mode too; a merely configured default is not, since
 	// defaultAgent is the identity a governed session starts from.
@@ -491,7 +529,10 @@ func assemble(opts options) (*app, error) {
 	if err != nil {
 		// No policy: this session is plain-only. That is an error when
 		// governance was explicitly requested, and merely a fact otherwise.
-		if a.governed {
+		if a.governed || opts.resumeSession != "" {
+			if opts.resumeSession != "" {
+				return nil, errors.New("cannot resume a session without its workflow policy")
+			}
 			return nil, fmt.Errorf("workflow is enabled but the policy could not be read: %w", err)
 		}
 		a.governed = false
@@ -518,7 +559,7 @@ func assemble(opts options) (*app, error) {
 	// Fail closed: without a git work tree there is no way to detect a moving
 	// tree, so gate evidence could not be trusted.
 	if _, err := finger.Fingerprint(context.Background()); err != nil {
-		if a.governed {
+		if a.governed || opts.resumeSession != "" {
 			return nil, fmt.Errorf("governed sessions require a git repository: %w", err)
 		}
 		// Plain-only: keep the session usable, but do not offer a switch that
@@ -532,10 +573,20 @@ func assemble(opts options) (*app, error) {
 	// Starting plain: the enforcer is built and ready, but not engaged, and no
 	// task is created until governance is actually switched on.
 	if !a.governed {
+		if opts.resumeSession != "" {
+			return nil, errors.New("cannot resume a governed session while workflow is disabled")
+		}
 		return a, nil
 	}
 	a.enforcer = enforce.New(a.policy, machine, policyPath)
 	a.governor = a.enforcer
+
+	if opts.resumeSession != "" {
+		if err := a.loadSession(opts.resumeSession); err != nil {
+			return nil, err
+		}
+		return a, nil
+	}
 
 	// Reporting the configuration must not leave a task behind.
 	if opts.inspectOnly {
@@ -797,6 +848,10 @@ func (a *app) newLoop(observer agent.Observer, confirmer agent.Confirmer) *agent
 		// as the agent that owns its current stage.
 		SystemPrompt: a.systemPrompt(),
 	}
+	if len(a.conversation) > 0 {
+		loop.SetMessages(a.conversation)
+		loop.SetSystemPrompt(a.systemPrompt())
+	}
 	if a.governed {
 		a.attachGovernance(loop)
 	}
@@ -841,19 +896,33 @@ func (a *app) operatorActor() string {
 	return a.policy.AgentFor(workflow.RoleOrchestrator)
 }
 
-// printTasks lists the project's governed tasks, newest first.
-//
-// Recovering a task needs its ID, and the ID only otherwise appears in the
-// transcript of the session that created it.
+// printTasks shows the persisted task checkpoints in newest-first order.
 func (a *app) printTasks() error {
-	store := session.NewStore(config.StatePath(a.project))
-	ids, err := store.List()
+	return printTasksAt(a.project)
+}
+
+func printTasksAt(project string) error {
+	tasks, err := loadTasks(project)
 	if err != nil {
 		return err
 	}
-	if len(ids) == 0 {
+	if len(tasks) == 0 {
 		fmt.Println("no governed tasks recorded for this project")
 		return nil
+	}
+
+	for _, task := range tasks {
+		fmt.Printf("%s  %-18s %s  %s\n", task.ID, task.State,
+			task.UpdatedAt.Format("2006-01-02 15:04"), truncateLine(task.Objective, 48))
+	}
+	return nil
+}
+
+func loadTasks(project string) ([]*workflow.Task, error) {
+	store := session.NewStore(config.StatePath(project))
+	ids, err := store.List()
+	if err != nil {
+		return nil, err
 	}
 
 	tasks := make([]*workflow.Task, 0, len(ids))
@@ -868,12 +937,74 @@ func (a *app) printTasks() error {
 	sort.Slice(tasks, func(i, j int) bool {
 		return tasks[i].UpdatedAt.After(tasks[j].UpdatedAt)
 	})
+	return tasks, nil
+}
 
+// sessionPickerModel is the small pre-session UI used by `agentwarden resume`.
+// It exits before the normal agent TUI is built, so selecting a row can feed
+// the same persisted-session path as an explicit ID.
+type sessionPickerModel struct {
+	picker   *tui.Picker
+	width    int
+	selected string
+}
+
+func newSessionPicker(tasks []*workflow.Task) *sessionPickerModel {
+	choices := make([]tui.Choice, 0, len(tasks))
 	for _, task := range tasks {
-		fmt.Printf("%s  %-18s %s  %s\n", task.ID, task.State,
+		label := fmt.Sprintf("%-18s %s  %s", task.State,
 			task.UpdatedAt.Format("2006-01-02 15:04"), truncateLine(task.Objective, 48))
+		choices = append(choices, tui.Choice{Value: task.ID, Label: label})
 	}
-	return nil
+	picker := tui.NewPicker(12)
+	picker.Open("Resume a session", choices, "")
+	return &sessionPickerModel{picker: picker, width: 100}
+}
+
+func (m *sessionPickerModel) Init() tea.Cmd { return nil }
+
+func (m *sessionPickerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "up", "k":
+			m.picker.Move(-1)
+		case "down", "j":
+			m.picker.Move(1)
+		case "enter":
+			if choice, ok := m.picker.Selected(); ok {
+				m.selected = choice.Value
+				return m, tea.Quit
+			}
+		case "esc", "ctrl+c":
+			return m, tea.Quit
+		}
+	}
+	return m, nil
+}
+
+func (m *sessionPickerModel) View() string {
+	return "\n" + m.picker.View(m.width) + "\n"
+}
+
+func chooseSession(project string) (string, error) {
+	tasks, err := loadTasks(project)
+	if err != nil {
+		return "", err
+	}
+	if len(tasks) == 0 {
+		fmt.Println("no governed tasks recorded for this project")
+		return "", nil
+	}
+
+	model := newSessionPicker(tasks)
+	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	if _, err := program.Run(); err != nil {
+		return "", err
+	}
+	return model.selected, nil
 }
 
 // truncateLine shortens text to one readable column.
@@ -911,6 +1042,36 @@ func (a *app) resumeTask(taskID string) error {
 		return err
 	}
 	fmt.Printf("task %s is now %s\n", task.ID, task.State)
+	return nil
+}
+
+// loadSession attaches a persisted task and conversation to the next session.
+func (a *app) loadSession(taskID string) error {
+	if a.ctl == nil || a.policy == nil {
+		return errors.New("no workflow policy is loaded for this project")
+	}
+	task, err := a.ctl.Get(taskID)
+	if err != nil {
+		return err
+	}
+	if task.PolicyHash != a.policy.Hash() {
+		return fmt.Errorf("session %s was created with a different workflow policy", task.ID)
+	}
+	if task.State == workflow.StateBlocked {
+		task, err = a.ctl.Resume(task.ID, a.operatorActor())
+		if err != nil {
+			return err
+		}
+	}
+	conversation, err := session.NewStore(config.StatePath(a.project)).LoadMessages(task.ID)
+	if err != nil {
+		return err
+	}
+	a.task = task
+	a.conversation = conversation
+	a.actor = &controller.Actor{TaskID: task.ID}
+	a.syncActor()
+	controller.Register(a.tools, a.ctl, a.actor)
 	return nil
 }
 
@@ -1059,6 +1220,7 @@ func (a *app) runTUI() error {
 		State:         a.WorkflowState(),
 		Stages:        a.stages(),
 		ContextWindow: a.ContextWindow(),
+		Messages:      a.conversation,
 	})
 
 	// Rebuild the controller so gate progress reports into the UI: a long
@@ -1139,6 +1301,9 @@ func (r *governedRunner) Run(ctx context.Context, prompt string) (agent.Result, 
 	r.app.syncActor()
 	r.app.retargetSession(r.loop)
 	result, err := r.loop.Run(ctx, prompt)
+	if saveErr := r.app.saveConversation(r.loop); saveErr != nil {
+		err = errors.Join(err, saveErr)
+	}
 	if err != nil || r.app.ctl == nil || r.app.task == nil {
 		return result, err
 	}
@@ -1157,4 +1322,16 @@ func (r *governedRunner) Run(ctx context.Context, prompt string) (agent.Result, 
 		}
 	}
 	return result, nil
+}
+
+func (a *app) saveConversation(loop *agent.Loop) error {
+	if a.task == nil {
+		return nil
+	}
+	messages := loop.Messages()
+	if err := session.NewStore(config.StatePath(a.project)).SaveMessages(a.task.ID, messages); err != nil {
+		return err
+	}
+	a.conversation = messages
+	return nil
 }

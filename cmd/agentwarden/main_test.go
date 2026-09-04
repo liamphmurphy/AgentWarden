@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/lmurphy/agentwarden/internal/agent"
 	"github.com/lmurphy/agentwarden/internal/config"
 	"github.com/lmurphy/agentwarden/internal/controller"
@@ -369,6 +370,45 @@ func TestResumeTaskReopensABlockedTask(t *testing.T) {
 	}
 	if reopened.State != workflow.StatePlanning {
 		t.Errorf("state = %s, want planning", reopened.State)
+	}
+}
+
+func TestLoadSessionRestoresCheckpointAndReopensBlockedTask(t *testing.T) {
+	a := newTestApp(t)
+	task, err := a.ctl.Start(context.Background(), "add request timeouts")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := a.ctl.Block(task.ID, "tech-lead", "waiting on an answer"); err != nil {
+		t.Fatalf("Block: %v", err)
+	}
+
+	if err := a.loadSession(task.ID); err != nil {
+		t.Fatalf("loadSession(%q): %v", task.ID, err)
+	}
+	if a.task.State != workflow.StatePlanning {
+		t.Errorf("loadSession(%q) state = %s, want planning", task.ID, a.task.State)
+	}
+	if a.actor.TaskID != task.ID {
+		t.Errorf("loadSession(%q) actor task id = %q, want %q", task.ID, a.actor.TaskID, task.ID)
+	}
+	if a.actor.AgentID != "tech-lead" {
+		t.Errorf("loadSession(%q) actor agent = %q, want tech-lead", task.ID, a.actor.AgentID)
+	}
+}
+
+func TestSessionPickerNavigatesAndConfirmsWithEnter(t *testing.T) {
+	tasks := []*workflow.Task{
+		{ID: "newest", State: workflow.StateImplementing, Objective: "new task"},
+		{ID: "older", State: workflow.StatePlanning, Objective: "old task"},
+	}
+	model := newSessionPicker(tasks)
+
+	model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if model.selected != "older" {
+		t.Errorf("sessionPicker selected = %q, want older", model.selected)
 	}
 }
 

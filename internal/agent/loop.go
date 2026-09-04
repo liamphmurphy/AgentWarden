@@ -124,6 +124,11 @@ func (l *Loop) Messages() []provider.Message {
 // Reset clears the conversation, keeping configuration.
 func (l *Loop) Reset() { l.messages = nil }
 
+// SetMessages restores a conversation checkpoint, keeping configuration.
+func (l *Loop) SetMessages(messages []provider.Message) {
+	l.messages = append([]provider.Message(nil), messages...)
+}
+
 // SetSystemPrompt replaces the system prompt, including on a conversation
 // already under way.
 //

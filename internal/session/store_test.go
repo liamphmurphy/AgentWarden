@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/lmurphy/agentwarden/internal/provider"
 	"github.com/lmurphy/agentwarden/internal/workflow"
 )
 
@@ -63,6 +65,35 @@ func TestLoadMissingTask(t *testing.T) {
 	store := NewStore(t.TempDir())
 	if _, err := store.Load("nope"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestMessagesRoundTrip(t *testing.T) {
+	store := NewStore(t.TempDir())
+	want := []provider.Message{
+		{Role: provider.RoleUser, Text: "inspect the service"},
+		{Role: provider.RoleAssistant, Text: "I found the handler."},
+	}
+
+	if err := store.SaveMessages("t1", want); err != nil {
+		t.Fatalf("SaveMessages: %v", err)
+	}
+	got, err := store.LoadMessages("t1")
+	if err != nil {
+		t.Fatalf("LoadMessages: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("LoadMessages(%q) = %#v, want %#v", "t1", got, want)
+	}
+}
+
+func TestLoadMessagesMissingCheckpoint(t *testing.T) {
+	messages, err := NewStore(t.TempDir()).LoadMessages("t1")
+	if err != nil {
+		t.Fatalf("LoadMessages on an older task: %v", err)
+	}
+	if len(messages) != 0 {
+		t.Errorf("LoadMessages on an older task = %#v, want empty", messages)
 	}
 }
 

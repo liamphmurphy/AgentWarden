@@ -210,6 +210,8 @@ type Options struct {
 	Stages []Stage
 	// ContextWindow is the starting model's window in tokens, 0 when unknown.
 	ContextWindow int
+	// Messages is an optional conversation checkpoint to show on startup.
+	Messages []provider.Message
 	// GlamourStyle is the style name resolved by DetectTheme before the
 	// program starts. Empty falls back to a fixed dark style; it must never
 	// be auto-detected here, because resize rebuilds the renderer while
@@ -239,7 +241,7 @@ func New(opts Options) *Model {
 		renderer = nil
 	}
 
-	return &Model{
+	m := &Model{
 		glamourStyle: style,
 		showStatus:   true,
 		status: &StatusPane{
@@ -266,6 +268,38 @@ func New(opts Options) *Model {
 		State:         opts.State,
 		showGates:     opts.Governed && len(opts.Gates) > 0,
 	}
+	m.restoreMessages(opts.Messages)
+	return m
+}
+
+// restoreMessages reconstructs the visible transcript from the provider
+// conversation saved with a resumed task. System messages are instructions,
+// not chat entries, so they stay out of the transcript.
+func (m *Model) restoreMessages(messages []provider.Message) {
+	for _, message := range messages {
+		switch message.Role {
+		case provider.RoleUser:
+			if strings.TrimSpace(message.Text) != "" {
+				m.transcript = append(m.transcript, styleUser.Render("› "+message.Text))
+			}
+		case provider.RoleAssistant:
+			if strings.TrimSpace(message.Text) != "" {
+				text := strings.TrimSpace(message.Text)
+				m.transcript = append(m.transcript, m.render(text))
+				m.lastReply = text
+			}
+		case provider.RoleTool:
+			if strings.TrimSpace(message.Text) != "" {
+				label := message.Name
+				if label == "" {
+					label = "tool"
+				}
+				m.transcript = append(m.transcript,
+					styleMuted.Render("  "+label+": "+message.Text))
+			}
+		}
+	}
+	m.refresh()
 }
 
 // SetSwitcher attaches the governance switcher, for the same reason SetRunner

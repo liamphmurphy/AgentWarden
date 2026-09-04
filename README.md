@@ -552,7 +552,19 @@ model could call to leave them. Those are the operator's to resolve:
 agentwarden -tasks               # every task in this project, newest first
 agentwarden -resume <task-id>    # reopen a blocked task
 agentwarden -cancel <task-id>    # take a task out of play
+agentwarden resume               # list previous governed sessions
+agentwarden resume <task-id>     # continue one at its saved workflow stage
 ```
+
+With no ID, the command opens a small session picker. Use the up/down arrows
+to highlight a task, press Enter to continue it, or Esc to leave without
+starting a session.
+
+The `resume` command uses the same `.agentwarden/state/` task records as the
+operator flags. It restores the governed workflow checkpoint — objective,
+plan, handoff, receipts, current stage, and saved conversation. Sessions
+created before conversation persistence was added have no transcript to
+restore.
 
 ```
 e317147f7150  qa_review          2026-09-04 12:39  interactive session
