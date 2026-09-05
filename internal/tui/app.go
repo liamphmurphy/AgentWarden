@@ -138,6 +138,10 @@ type Model struct {
 
 	// transcript holds completed exchanges as rendered text.
 	transcript []string
+	// chatMessages keeps the source behind user and assistant transcript
+	// entries. A resize can then reflow the boxes instead of stretching or
+	// clipping the rendering produced at the previous terminal width.
+	chatMessages []chatMessageView
 	// streaming accumulates the in-flight assistant reply.
 	streaming strings.Builder
 	// lastReply is the plain text of the most recent assistant reply.
@@ -203,6 +207,15 @@ type Model struct {
 	// Rebuilding a renderer with WithAutoStyle would re-query the terminal
 	// mid-session and leak the reply into the input box.
 	glamourStyle string
+}
+
+// chatMessageView connects a restorable provider message to its rendered
+// transcript entry. Tool output and runtime notes have their own presentation
+// and deliberately do not become chat bubbles.
+type chatMessageView struct {
+	Role            provider.Role
+	Text            string
+	TranscriptIndex int
 }
 
 // Options configures a Model.
@@ -298,12 +311,12 @@ func (m *Model) restoreMessages(messages []provider.Message) {
 		switch message.Role {
 		case provider.RoleUser:
 			if strings.TrimSpace(message.Text) != "" {
-				m.transcript = append(m.transcript, styleUser.Render("› "+message.Text))
+				m.appendChatMessage(provider.RoleUser, message.Text)
 			}
 		case provider.RoleAssistant:
 			if strings.TrimSpace(message.Text) != "" {
 				text := strings.TrimSpace(message.Text)
-				m.transcript = append(m.transcript, m.render(text))
+				m.appendChatMessage(provider.RoleAssistant, text)
 				m.lastReply = text
 			}
 		case provider.RoleTool:
@@ -628,7 +641,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.transcript = append(m.transcript, m.renderError(msg.err))
 		}
 		if text := strings.TrimSpace(m.streaming.String()); text != "" {
-			m.transcript = append(m.transcript, m.render(text))
+			m.appendChatMessage(provider.RoleAssistant, text)
 			m.lastReply = text
 		}
 		m.streaming.Reset()
@@ -1007,6 +1020,7 @@ func (m *Model) command(input string) (bool, tea.Cmd) {
 		return true, m.toggleMouse()
 	case "/clear":
 		m.transcript = nil
+		m.chatMessages = nil
 		m.lastReply = ""
 		m.follow = true
 	case "/quit", "/exit":
@@ -1028,7 +1042,7 @@ func onOff(b bool) string {
 
 // submit starts a run in the background.
 func (m *Model) submit(prompt string) tea.Cmd {
-	m.transcript = append(m.transcript, styleUser.Render("› "+prompt))
+	m.appendChatMessage(provider.RoleUser, prompt)
 	m.busy = true
 	m.err = nil
 	m.gates.Reset()
@@ -1073,6 +1087,7 @@ func (m *Model) resize(width, height int) {
 			m.renderer = renderer
 		}
 	}
+	m.rerenderChatMessages()
 	m.refresh()
 }
 
@@ -1098,6 +1113,52 @@ func (m *Model) render(text string) string {
 		return text
 	}
 	return strings.TrimRight(out, "\n")
+}
+
+// appendChatMessage records the source and rendered form together. Restore and
+// live delivery both go through this path so resumed conversations cannot
+// silently fall back to the old unboxed presentation.
+func (m *Model) appendChatMessage(role provider.Role, text string) {
+	message := chatMessageView{
+		Role:            role,
+		Text:            text,
+		TranscriptIndex: len(m.transcript),
+	}
+	m.chatMessages = append(m.chatMessages, message)
+	m.transcript = append(m.transcript, m.renderChatMessage(role, text))
+}
+
+// rerenderChatMessages keeps completed boxes responsive when the viewport
+// changes width. The provider conversation remains the persisted source of
+// truth; this slice only retains enough presentation state for the live UI.
+func (m *Model) rerenderChatMessages() {
+	for _, message := range m.chatMessages {
+		if message.TranscriptIndex >= len(m.transcript) {
+			continue
+		}
+		m.transcript[message.TranscriptIndex] = m.renderChatMessage(message.Role, message.Text)
+	}
+}
+
+// renderChatMessage gives the two speakers distinct but related containers.
+// Width excludes the border because lipgloss adds it after laying out the
+// block; subtracting it keeps the finished bubble inside the viewport.
+func (m *Model) renderChatMessage(role provider.Role, text string) string {
+	style := styleAssistantBubble
+	label := styleAssistantLabel.Render("Agent")
+	body := m.render(text)
+	if role == provider.RoleUser {
+		style = styleUserBubble
+		label = styleUserLabel.Render("You")
+		body = text
+	}
+
+	width := m.viewport.Width
+	if width <= 0 {
+		width = 80
+	}
+	width = max(1, width-style.GetHorizontalBorderSize())
+	return style.Copy().Width(width).Render(label + "\n" + body)
 }
 
 // renderError keeps the complete runtime error in the scrollable transcript.
@@ -1133,7 +1194,7 @@ func (m *Model) refresh() {
 		}
 	}
 	if streaming := m.streaming.String(); streaming != "" {
-		parts = append(parts, m.render(streaming))
+		parts = append(parts, m.renderChatMessage(provider.RoleAssistant, streaming))
 	}
 	m.viewport.SetContent(strings.Join(parts, "\n"))
 	if m.follow {
@@ -1158,7 +1219,7 @@ func (m *Model) scrollDown(lines int) {
 func (m *Model) transcriptText() string {
 	parts := append([]string(nil), m.transcript...)
 	if streaming := m.streaming.String(); streaming != "" {
-		parts = append(parts, streaming)
+		parts = append(parts, m.renderChatMessage(provider.RoleAssistant, streaming))
 	}
 	return plainText(strings.Join(parts, "\n"))
 }

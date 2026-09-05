@@ -70,12 +70,23 @@ var (
 )
 
 var (
-	styleUser   = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
-	styleMuted  = lipgloss.NewStyle().Foreground(colorMuted)
-	styleOK     = lipgloss.NewStyle().Foreground(colorOK)
-	styleFail   = lipgloss.NewStyle().Foreground(colorFail)
-	styleWarn   = lipgloss.NewStyle().Foreground(colorWarn)
-	styleAccent = lipgloss.NewStyle().Foreground(colorAccent)
+	styleUserLabel      = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	styleAssistantLabel = lipgloss.NewStyle().Foreground(colorMuted).Bold(true)
+	styleMuted          = lipgloss.NewStyle().Foreground(colorMuted)
+	styleOK             = lipgloss.NewStyle().Foreground(colorOK)
+	styleFail           = lipgloss.NewStyle().Foreground(colorFail)
+	styleWarn           = lipgloss.NewStyle().Foreground(colorWarn)
+	styleAccent         = lipgloss.NewStyle().Foreground(colorAccent)
+
+	styleUserBubble = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colorAccent).
+			Padding(0, 1)
+
+	styleAssistantBubble = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(colorBorder).
+				Padding(0, 1)
 
 	stylePane = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).

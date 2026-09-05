@@ -471,6 +471,62 @@ func TestNewRestoresConversationTranscript(t *testing.T) {
 	if strings.Contains(stripANSI(strings.Join(m.transcript, "\n")), "internal workflow correction") {
 		t.Error("restored transcript includes a runtime-internal correction")
 	}
+	for i, wantLabel := range []string{"You", "Agent"} {
+		bubble := stripANSI(m.transcript[i])
+		if !strings.Contains(bubble, wantLabel) || !strings.Contains(bubble, "╭") || !strings.Contains(bubble, "╰") {
+			t.Errorf("restored message %d is not a labelled box:\n%s", i, bubble)
+		}
+	}
+}
+
+// TestResumedChatUsesTheLiveMessageBubbles ensures persistence does not
+// reconstruct a visually different transcript from the one shown while the
+// messages were originally sent.
+func TestResumedChatUsesTheLiveMessageBubbles(t *testing.T) {
+	live := New(Options{})
+	live.resize(72, 20)
+	live.submit("inspect the service")
+	cancel := live.cancel
+	t.Cleanup(cancel)
+	live.Update(deltaMsg("I found the **handler**."))
+	live.Update(doneMsg{})
+
+	resumed := New(Options{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Text: "inspect the service"},
+			{Role: provider.RoleAssistant, Text: "I found the **handler**."},
+		},
+	})
+	resumed.resize(72, 20)
+
+	if len(live.transcript) != len(resumed.transcript) {
+		t.Fatalf("resumed transcript has %d entries, want %d", len(resumed.transcript), len(live.transcript))
+	}
+	for i := range live.transcript {
+		got := stripANSI(resumed.transcript[i])
+		want := stripANSI(live.transcript[i])
+		if got != want {
+			t.Errorf("resumed message %d differs from its live bubble:\ngot:\n%s\nwant:\n%s", i, got, want)
+		}
+	}
+}
+
+func TestResizeReflowsChatMessageBubbles(t *testing.T) {
+	m := New(Options{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Text: "Please inspect the service and explain how the request moves through the handler."},
+			{Role: provider.RoleAssistant, Text: "The request enters the handler and is then passed to the controller."},
+		},
+	})
+
+	for _, width := range []int{54, 34} {
+		m.resize(width, 20)
+		for i, bubble := range m.transcript {
+			if got := lipglossWidth(bubble); got != width {
+				t.Errorf("message %d width after resize(%d) = %d, want %d", i, width, got, width)
+			}
+		}
+	}
 }
 
 func TestCtrlCQuitsWhenIdle(t *testing.T) {
