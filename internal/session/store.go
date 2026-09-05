@@ -147,7 +147,29 @@ func (s *Store) LoadMessages(taskID string) ([]provider.Message, error) {
 		return nil, fmt.Errorf("parse messages for %s: %w", taskID, err)
 	}
 	markLegacyInternalMessages(messages)
-	return messages, nil
+	return normalizeMessages(messages), nil
+}
+
+// normalizeMessages repairs checkpoints produced by an endpoint that ended a
+// turn after hidden reasoning but before emitting content or a tool call. An
+// empty assistant message carries no restorable state; once it is removed,
+// identical runtime corrections beside it can be collapsed as well.
+func normalizeMessages(messages []provider.Message) []provider.Message {
+	normalized := make([]provider.Message, 0, len(messages))
+	for _, message := range messages {
+		if message.Role == provider.RoleAssistant &&
+			strings.TrimSpace(message.Text) == "" && len(message.ToolCalls) == 0 {
+			continue
+		}
+		if message.Internal && message.Role == provider.RoleUser && len(normalized) > 0 {
+			last := normalized[len(normalized)-1]
+			if last.Internal && last.Role == provider.RoleUser && last.Text == message.Text {
+				continue
+			}
+		}
+		normalized = append(normalized, message)
+	}
+	return normalized
 }
 
 // markLegacyInternalMessages preserves checkpoints written before Message

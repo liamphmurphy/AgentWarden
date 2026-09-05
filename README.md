@@ -160,7 +160,7 @@ agentwarden --config                               # show the resolved configura
       "baseUrl": "http://127.0.0.1:11434/v1",
       // contextWindow is optional; set it to see context pressure as a
       // percentage in the session panel.
-      "models": { "qwen3.5:latest": { "name": "qwen3.5", "contextWindow": 8192 } }
+      "models": { "qwen3.5:latest": { "name": "qwen3.5", "contextWindow": 65536 } }
     },
     "gateway": {
       "baseUrl": "https://your-gateway.example.com/v1",
@@ -346,8 +346,10 @@ Neither is strictly about model size, but both matter most with a weak model:
 - **The escalation ladder** (`on_violation: [warn, force, auto]`, per state).
   A first violation returns a corrective tool result containing a *filled-in
   argument skeleton* rather than an explanation — small models copy templates
-  and argue with prose. A second flips on `tool_choice` pinning. A third has
-  the runtime perform the action itself.
+  and argue with prose. A second flips on `tool_choice` pinning. A third stops
+  with a focused diagnostic when the handoff still did not happen; the runtime
+  will not fabricate a plan, implementation summary or QA verdict merely to
+  move the state machine.
 - **The direct-work budget** (`max_direct_tool_calls`, per state). After N
   non-handoff calls in a stage, the handoff is pinned. This is the guard for a
   model that reads the same three files in a loop instead of committing to a
@@ -455,6 +457,15 @@ Two honest gaps worth knowing about:
   at its own default (`OLLAMA_CONTEXT_LENGTH`, or `num_ctx` in a Modelfile).
   Putting the architecture number in the config would draw a meter reading 5%
   as the request was being silently cut.
+
+  Agent prompts and tool schemas can consume 4K before the first model turn,
+  so start Ollama with enough served context for agentic work and put the same
+  value in AgentWarden's `contextWindow` display setting:
+
+  ```sh
+  OLLAMA_CONTEXT_LENGTH=65536 ollama serve
+  ollama ps # verify the loaded model's CONTEXT column
+  ```
 
 If an endpoint reports no usage at all, both counters say `not reported`
 instead of showing zeros — an unmeasured session and a free one are not the
@@ -585,6 +596,13 @@ in `qa_review` is one approval away from `complete`, and nothing expires it.
 `--auto` pre-approves tool calls that would otherwise prompt. It upgrades
 "ask" to "allow" but **never overrides an explicit `deny` rule** — a rule you
 wrote outranks a convenience flag. Toggle it in-session with `/auto`.
+
+Without `--auto`, an `ask` decision pauses the tool call and opens a permission
+pane showing the tool, action and target. `enter` or `y` allows it once, `a`
+allows that exact action and target for the rest of the session, and `esc` or
+`n` denies it. `ctrl+c` denies the pending action and cancels the run. The
+confirmation pane owns the keyboard while open, so a key cannot also submit or
+edit the prompt behind it.
 
 ## Switching provider and model
 

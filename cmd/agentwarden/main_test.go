@@ -155,6 +155,20 @@ func TestGovernedPromptIncludesStageSkills(t *testing.T) {
 	}
 }
 
+func TestGovernedPromptWithoutAgentDefinitionDoesNotClaimPlainMode(t *testing.T) {
+	a := newTestApp(t)
+	a.agents = agent.NewRegistry()
+	a.agentDef = nil
+
+	got := a.systemPrompt()
+	if !strings.Contains(got, "governed by a workflow") {
+		t.Errorf("governed fallback does not describe the workflow:\n%s", got)
+	}
+	if strings.Contains(got, "no workflow") {
+		t.Errorf("governed fallback claims plain mode:\n%s", got)
+	}
+}
+
 func TestPromptIncludesProjectInstructions(t *testing.T) {
 	a := newTestApp(t)
 	a.projectInstructions = "# Project rules\n\nRun the focused tests."
@@ -350,12 +364,32 @@ func TestSetGovernedWithoutPolicyFails(t *testing.T) {
 
 func TestPlainRulesCoverTheAskingActions(t *testing.T) {
 	perms := enforce.NewPermissions(plainRules(), false)
-	// Without an explicit allow these default to asking, and the TUI has no
-	// confirmation prompt yet, so an empty rule set would refuse the work.
+	// Plain mode promises direct work, so its normal edit and shell actions do
+	// not need workflow-role confirmation.
 	for _, action := range []string{enforce.ActionEdit, enforce.ActionShell} {
 		if got := perms.Evaluate(action, "anything"); got != enforce.EffectAllow {
 			t.Errorf("plain %s = %q, want allow", action, got)
 		}
+	}
+}
+
+func TestSetAutoApprovalChangesLivePermissions(t *testing.T) {
+	a := newTestApp(t)
+	a.perms.SetRules(nil)
+
+	a.SetAutoApproval(true)
+	if !a.cfg.Auto {
+		t.Error("the resolved config should track live auto-approval")
+	}
+	if got := a.perms.Evaluate(enforce.ActionEdit, "README.md"); got != enforce.EffectAllow {
+		t.Errorf("ask-level edit = %q, want allow while auto is on", got)
+	}
+
+	a.perms.SetRules([]enforce.Rule{{
+		Action: enforce.ActionEdit, Resource: "*", Effect: enforce.EffectDeny,
+	}})
+	if got := a.perms.Evaluate(enforce.ActionEdit, "README.md"); got != enforce.EffectDeny {
+		t.Errorf("explicit deny = %q, want deny even while auto is on", got)
 	}
 }
 

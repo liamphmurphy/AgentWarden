@@ -156,7 +156,7 @@ func (o *recordingObserver) ToolStarted(call tool.Call) {
 // no network and no model:
 //
 //  1. the model tries to edit while planning and is hard-blocked,
-//  2. the next request is pinned to the handoff tool,
+//  2. the model complies with the required handoff,
 //  3. a masked tool never appears in the payload at all.
 func TestEnforcementEndToEnd(t *testing.T) {
 	policy := mustPolicy(t, testPolicy)
@@ -242,14 +242,12 @@ func TestEnforcementEndToEnd(t *testing.T) {
 		}
 	}
 
-	// After the violation the next request pins the handoff tool.
+	// A single rejected call is the warning rung. It must not be counted a
+	// second time as a final turn merely because the provider paused for the
+	// tool result.
 	second := requests[1]
-	if second.ToolChoice == nil {
-		t.Fatal("the request after a violation should constrain tool_choice")
-	}
-	if second.ToolChoice.Mode != provider.ToolChoiceFunction ||
-		second.ToolChoice.Name != enforce.ToolSubmitPlan {
-		t.Errorf("tool_choice = %+v, want a pin to %s", second.ToolChoice, enforce.ToolSubmitPlan)
+	if second.ToolChoice != nil {
+		t.Errorf("one violation should warn rather than pin tool_choice: %+v", second.ToolChoice)
 	}
 
 	// The banner restates the authoritative state every turn.
@@ -419,6 +417,107 @@ func TestTurnEndWithoutHandoffIsCorrected(t *testing.T) {
 	}
 	if !corrected {
 		t.Error("the model should be told which handoff is required")
+	}
+}
+
+// Tool calls are intermediate model-loop rounds, not final turns. Treating
+// each one as a missing handoff makes an implementer exhaust the three-rung
+// violation ladder while it is still inspecting and editing the repository.
+func TestIntermediateToolCallsDoNotConsumeHandoffViolations(t *testing.T) {
+	policy := mustPolicy(t, testPolicy)
+	machine := workflow.NewMachineWithTransitions(policy.Transitions(), newClock())
+	task := &workflow.Task{
+		ID: "t1", State: workflow.StateImplementing,
+		PolicyHash: policy.Hash(), Receipts: map[string]workflow.Receipt{},
+	}
+	model := fake.New(
+		fake.CallTurn("c1", enforce.ToolStatus, `{}`),
+		fake.CallTurn("c2", enforce.ToolHistory, `{}`),
+		fake.CallTurn("c3", enforce.ToolLS, `{"path":"."}`),
+		fake.CallTurn("c4", enforce.ToolSubmitImplementation, `{"summary":"done"}`),
+	)
+	sess := &enforce.Session{Role: workflow.RoleImplementer, AgentID: "engineer"}
+	loop := &Loop{
+		Provider: model,
+		Model:    "test",
+		Tools:    withHandoffs(testTools(t), task, machine),
+		Governor: enforce.New(policy, machine, ""),
+		Task:     task,
+		Session:  sess,
+	}
+
+	result, err := loop.Run(context.Background(), "implement it")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Blocked != 0 {
+		t.Errorf("intermediate tool work should not be blocked, got %d", result.Blocked)
+	}
+	if sess.Violations != 0 {
+		t.Errorf("intermediate tool work consumed %d handoff violations", sess.Violations)
+	}
+	if task.State != workflow.StateVerifying {
+		t.Errorf("handoff did not advance the task: %s", task.State)
+	}
+	if model.Remaining() != 0 {
+		t.Errorf("the model was stopped before its handoff, %d turns remain", model.Remaining())
+	}
+}
+
+// An OpenAI-compatible endpoint may emit only hidden reasoning when its
+// served context is exhausted. Such a turn has no assistant artifact worth
+// restoring and must not be retried until the generic 40-step limit.
+func TestEmptyTurnsStopAtWorkflowEscalationWithoutGrowingHistory(t *testing.T) {
+	policy := mustPolicy(t, testPolicy)
+	model := fake.New(
+		fake.TextTurn(""),
+		fake.TextTurn(""),
+		fake.TextTurn(""),
+		fake.TextTurn("never reached"),
+	)
+	task := &workflow.Task{
+		ID: "t1", State: workflow.StatePlanning,
+		PolicyHash: policy.Hash(), Receipts: map[string]workflow.Receipt{},
+	}
+	loop := &Loop{
+		Provider: model,
+		Model:    "test",
+		Tools:    withHandoffs(testTools(t), task, workflow.NewMachine(newClock())),
+		Governor: enforce.New(policy, workflow.NewMachine(newClock()), ""),
+		Task:     task,
+		Session:  &enforce.Session{},
+	}
+
+	result, err := loop.Run(context.Background(), "make a plan")
+	if err == nil {
+		t.Fatal("empty governed turns should stop with a diagnostic")
+	}
+	for _, want := range []string{enforce.ToolSubmitPlan, "served context window", "neither assistant text nor a tool call"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should contain %q: %v", want, err)
+		}
+	}
+	if result.Steps != 3 {
+		t.Errorf("steps = %d, want the three-rung escalation", result.Steps)
+	}
+	if model.Remaining() != 1 {
+		t.Errorf("the loop should stop before the step limit, %d turns remain", model.Remaining())
+	}
+
+	var assistants, corrections int
+	for _, message := range loop.Messages() {
+		switch {
+		case message.Role == provider.RoleAssistant:
+			assistants++
+		case message.Role == provider.RoleUser && message.Internal:
+			corrections++
+		}
+	}
+	if assistants != 0 {
+		t.Errorf("empty assistant turns should not be persisted, got %d", assistants)
+	}
+	if corrections != 1 {
+		t.Errorf("identical corrections should be deduplicated, got %d", corrections)
 	}
 }
 

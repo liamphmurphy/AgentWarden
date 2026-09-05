@@ -243,6 +243,15 @@ func (a *app) WorkflowState() workflow.State {
 	return a.task.State
 }
 
+// SetAutoApproval applies the TUI's live /auto toggle to the permission
+// evaluator rather than merely changing the status-bar label.
+func (a *app) SetAutoApproval(on bool) {
+	a.cfg.Auto = on
+	if a.perms != nil {
+		a.perms.SetAuto(on)
+	}
+}
+
 // SetGoverned engages or disengages the enforcer on the live session.
 //
 // Swapping the loop's governor is what makes the switch real: the TUI's own
@@ -314,9 +323,8 @@ func (a *app) SetGoverned(on bool) error {
 // -agent keeps its own rules: that restriction was the user's choice, not the
 // workflow's.
 //
-// The rules are stated rather than emptied because an unmatched edit or shell
-// action defaults to asking, and the TUI has no confirmation prompt yet, so an
-// empty rule set would refuse everything instead of allowing it.
+// The rules are stated rather than emptied because direct work in plain mode
+// should not stop for workflow-role confirmations that no longer apply.
 func (a *app) applyPlainPermissions() {
 	if a.perms == nil {
 		return
@@ -748,6 +756,14 @@ const plainPrompt = "You are a careful software engineering assistant working in
 	"This session has no workflow, no stages and no gates: there is nothing to plan through, " +
 	"delegate to or hand off. Carry out what is asked directly with the tools you have."
 
+// governedPrompt is the safe fallback when a workflow role names no installed
+// agent definition. Falling back to plainPrompt would tell a governed planner
+// that no workflow exists while offering only workflow handoff tools.
+const governedPrompt = "You are a careful software engineering assistant working in a terminal. " +
+	"This session is governed by a workflow state machine. Follow the current workflow state " +
+	"shown near the latest message, and call its required workflow handoff tool before ending " +
+	"the stage. Only the tools offered in the current request are available."
+
 // Notes handed to the model when governance changes mid-session. They are
 // short and declarative because their job is to contradict the earlier turns
 // still in context, not to explain the feature.
@@ -806,6 +822,8 @@ func (a *app) systemPrompt() string {
 	var parts []string
 	if def != nil && def.Prompt != "" {
 		parts = append(parts, def.Prompt)
+	} else if a.governed {
+		parts = append(parts, governedPrompt)
 	} else {
 		parts = append(parts, plainPrompt)
 	}
@@ -1221,6 +1239,7 @@ func (a *app) runTUI() error {
 		GlamourStyle:  glamourStyle,
 		Switcher:      a,
 		Models:        a,
+		Approvals:     a,
 		Gates:         gates,
 		Governed:      a.governed,
 		Auto:          a.cfg.Auto,
@@ -1249,7 +1268,7 @@ func (a *app) runTUI() error {
 
 	a.reportState = model.StateReporter()
 
-	loop := a.newLoop(model.Observer(), &tuiConfirmer{})
+	loop := a.newLoop(model.Observer(), model.Confirmer())
 	a.loop = loop
 	// Always the governed runner: it checks the live mode per run, so a switch
 	// takes effect without rebuilding anything.
@@ -1282,15 +1301,6 @@ func (a *app) stages() []tui.Stage {
 		out = append(out, stage)
 	}
 	return out
-}
-
-// tuiConfirmer approves in the TUI. Interactive confirmation prompts are a
-// follow-up; until then a call that would ask is refused unless --auto is set,
-// which errs toward not acting without consent.
-type tuiConfirmer struct{}
-
-func (tuiConfirmer) Confirm(context.Context, tool.Call, string, string) (bool, error) {
-	return false, nil
 }
 
 // governedRunner runs a prompt and then advances verification if the workflow

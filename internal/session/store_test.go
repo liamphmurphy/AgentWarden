@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lmurphy/agentwarden/internal/enforce"
 	"github.com/lmurphy/agentwarden/internal/provider"
 	"github.com/lmurphy/agentwarden/internal/workflow"
 )
@@ -108,6 +109,43 @@ func TestLoadMessagesMarksLegacyWorkflowCorrectionsInternal(t *testing.T) {
 	}
 	if !got[1].Internal {
 		t.Errorf("LoadMessages(legacy correction).Internal = false, want true: %q", got[1].Text)
+	}
+}
+
+func TestLoadMessagesDropsEmptyAssistantArtifactsAndDuplicateCorrections(t *testing.T) {
+	store := NewStore(t.TempDir())
+	correction := provider.Message{
+		Role: provider.RoleUser, Text: "BLOCKED: the turn ended in state planning without calling workflow_submit_plan",
+	}
+	messages := []provider.Message{
+		{Role: provider.RoleUser, Text: "make a plan"},
+		{Role: provider.RoleAssistant},
+		correction,
+		{Role: provider.RoleAssistant, Text: "   "},
+		correction,
+		{
+			Role: provider.RoleAssistant,
+			ToolCalls: []provider.ToolCall{{
+				ID: "c1", Name: enforce.ToolSubmitPlan, Args: `{"plan":"p"}`,
+			}},
+		},
+	}
+	if err := store.SaveMessages("t1", messages); err != nil {
+		t.Fatalf("SaveMessages: %v", err)
+	}
+
+	got, err := store.LoadMessages("t1")
+	if err != nil {
+		t.Fatalf("LoadMessages: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("LoadMessages returned %d messages, want prompt, one correction and tool call: %#v", len(got), got)
+	}
+	if !got[1].Internal {
+		t.Error("the retained legacy correction should be internal")
+	}
+	if len(got[2].ToolCalls) != 1 {
+		t.Errorf("an empty-content assistant tool call must be retained: %#v", got[2])
 	}
 }
 

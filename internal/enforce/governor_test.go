@@ -56,7 +56,7 @@ func TestNopPermitsEverythingButTheStateMachine(t *testing.T) {
 			t.Errorf("%s should be allowed when ungoverned", c.Name)
 		}
 	}
-	if d := nop.OnTurnEnd(task, sess, nil); !d.Allow {
+	if d := nop.OnTurnEnd(task, sess); !d.Allow {
 		t.Error("a turn should be free to end")
 	}
 	if d := nop.OnComplete(task, workflow.Fingerprint{}); !d.Allow {

@@ -160,9 +160,10 @@ editing a test to make a change pass, stop and reconsider the change.
     arrow keys drive the picker rather than the prompt history.
     See `TestPickerOwnsEnterWhileOpen` and `TestPickerKeepsArrowKeysWhileOpen`.
 
-    Key precedence in `handleKey` is: picker, then history, then the textarea.
-    History only engages at the edge line (`input.Line() == 0` for up, the last
-    line for down) so a multi-line draft still navigates normally.
+    Key precedence in `handleKey` is: permission confirmation, picker, history,
+    then the textarea. History only engages at the edge line (`input.Line() ==
+    0` for up, the last line for down) so a multi-line draft still navigates
+    normally.
 
 16. **Terminal capability detection happens before the program starts.**
     Querying the background colour writes an escape sequence and reads the
@@ -174,6 +175,14 @@ editing a test to make a change pass, stop and reconsider the change.
     handles the awkward cases (a file that does not exist yet, a symlinked
     root such as macOS `/tmp` → `/private/tmp`). Don't simplify it back into a
     prefix comparison.
+
+18. **An `ask` decision in the TUI must actually ask.** The model loop waits on
+    the confirmation response or its run context; it must never silently turn
+    `ask` into deny, leak the waiting goroutine on cancellation, or let modal
+    keystrokes reach the prompt behind it. Session approval is scoped to the
+    exact `(action, resource)` pair. See `TestConfirmationWaitsForExplicitApproval`,
+    `TestConfirmationOwnsKeyboardAndCanDeny` and
+    `TestConfirmationCancellationReleasesWaitingCall`.
 
 ## Conventions
 
@@ -234,9 +243,6 @@ Don't add these without discussion; each was considered.
   is designed for it, but it isn't wired up. Until it is, independent QA is
   sequence enforcement, not identity separation — say so honestly rather than
   implying otherwise.
-- **Interactive permission prompts in the TUI.** `tuiConfirmer` currently
-  refuses anything needing confirmation unless `--auto` is set. That errs
-  toward not acting without consent.
 - **A second provider adapter.** The `Provider` interface exists so one can be
   added; nothing needs it yet.
 - **Treating this as a security boundary.** It isn't, the README says so, and

@@ -259,7 +259,7 @@ func TestOnTurnEndDetectsMissingHandoff(t *testing.T) {
 	task := newTask(workflow.StatePlanning, policy)
 	sess := &Session{Role: workflow.RolePlanner}
 
-	d := e.OnTurnEnd(task, sess, []string{ToolRead, ToolGrep})
+	d := e.OnTurnEnd(task, sess)
 	if d.Allow {
 		t.Fatal("ending a planning turn without submitting a plan must be caught")
 	}
@@ -271,8 +271,9 @@ func TestOnTurnEndDetectsMissingHandoff(t *testing.T) {
 func TestOnTurnEndAcceptsHandoff(t *testing.T) {
 	e, policy := newEnforcer(t, twoGatePolicy)
 	task := newTask(workflow.StatePlanning, policy)
+	sess := &Session{HandedOff: true}
 
-	d := e.OnTurnEnd(task, &Session{}, []string{ToolRead, ToolSubmitPlan})
+	d := e.OnTurnEnd(task, sess)
 	if !d.Allow {
 		t.Errorf("a turn that handed off should be accepted: %+v", d)
 	}
@@ -282,7 +283,7 @@ func TestOnTurnEndIgnoresStatesWithoutHandoff(t *testing.T) {
 	e, policy := newEnforcer(t, twoGatePolicy)
 	for _, state := range []workflow.State{workflow.StateVerifying, workflow.StateComplete} {
 		task := newTask(state, policy)
-		if d := e.OnTurnEnd(task, &Session{}, nil); !d.Allow {
+		if d := e.OnTurnEnd(task, &Session{}); !d.Allow {
 			t.Errorf("state %s has no mandatory handoff, got %+v", state, d)
 		}
 	}

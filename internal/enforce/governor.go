@@ -29,8 +29,8 @@ type Governor interface {
 	ToolChoice(task *workflow.Task, sess *Session) *provider.ToolChoice
 	// Intercept judges a tool call before it executes.
 	Intercept(task *workflow.Task, sess *Session, call provider.ToolCall) Decision
-	// OnTurnEnd judges a turn that is about to end.
-	OnTurnEnd(task *workflow.Task, sess *Session, calledTools []string) Decision
+	// OnTurnEnd judges a turn that is about to end without another tool call.
+	OnTurnEnd(task *workflow.Task, sess *Session) Decision
 	// OnComplete judges an attempt to finish the task.
 	OnComplete(task *workflow.Task, current workflow.Fingerprint) Decision
 	// Banner renders the per-turn state block, or "" when not governed.
@@ -91,7 +91,7 @@ func (Nop) Intercept(_ *workflow.Task, _ *Session, call provider.ToolCall) Decis
 }
 
 // OnTurnEnd allows the turn to end.
-func (Nop) OnTurnEnd(*workflow.Task, *Session, []string) Decision { return allow() }
+func (Nop) OnTurnEnd(*workflow.Task, *Session) Decision { return allow() }
 
 // OnComplete allows completion.
 func (Nop) OnComplete(*workflow.Task, workflow.Fingerprint) Decision { return allow() }

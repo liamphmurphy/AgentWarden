@@ -111,14 +111,24 @@ type ModeSwitcher interface {
 	WorkflowState() workflow.State
 }
 
+// ApprovalSwitcher changes whether ask-level permissions are approved without
+// prompting. Explicit deny rules remain in force inside the permission layer.
+type ApprovalSwitcher interface {
+	SetAutoApproval(on bool)
+}
+
 // Model is the Bubble Tea model.
 type Model struct {
-	runner   Runner
-	switcher ModeSwitcher
-	models   ModelSwitcher
-	picker   *Picker
-	history  *History
-	events   chan tea.Msg
+	runner           Runner
+	switcher         ModeSwitcher
+	models           ModelSwitcher
+	approvals        ApprovalSwitcher
+	picker           *Picker
+	confirmationPane *confirmationPane
+	confirmation     *confirmationMsg
+	confirmer        *confirmer
+	history          *History
+	events           chan tea.Msg
 
 	viewport viewport.Model
 	input    textarea.Model
@@ -200,6 +210,7 @@ type Options struct {
 	Runner    Runner
 	Switcher  ModeSwitcher
 	Models    ModelSwitcher
+	Approvals ApprovalSwitcher
 	Gates     []workflow.Gate
 	Governed  bool
 	Auto      bool
@@ -241,6 +252,7 @@ func New(opts Options) *Model {
 		renderer = nil
 	}
 
+	events := make(chan tea.Msg, 256)
 	m := &Model{
 		glamourStyle: style,
 		showStatus:   true,
@@ -250,24 +262,27 @@ func New(opts Options) *Model {
 			Governed:      opts.Governed,
 			ContextWindow: opts.ContextWindow,
 		},
-		switcher:      opts.Switcher,
-		models:        opts.Models,
-		picker:        NewPicker(8),
-		follow:        true,
-		mouseCaptured: true,
-		history:       NewHistory(0),
-		runner:        opts.Runner,
-		events:        make(chan tea.Msg, 256),
-		viewport:      viewport.New(80, 20),
-		input:         input,
-		renderer:      renderer,
-		gates:         NewGatePane(opts.Gates),
-		Governed:      opts.Governed,
-		Auto:          opts.Auto,
-		ModelName:     opts.ModelName,
-		State:         opts.State,
-		showGates:     opts.Governed && len(opts.Gates) > 0,
+		switcher:         opts.Switcher,
+		models:           opts.Models,
+		approvals:        opts.Approvals,
+		picker:           NewPicker(8),
+		confirmationPane: &confirmationPane{},
+		follow:           true,
+		mouseCaptured:    true,
+		history:          NewHistory(0),
+		runner:           opts.Runner,
+		events:           events,
+		viewport:         viewport.New(80, 20),
+		input:            input,
+		renderer:         renderer,
+		gates:            NewGatePane(opts.Gates),
+		Governed:         opts.Governed,
+		Auto:             opts.Auto,
+		ModelName:        opts.ModelName,
+		State:            opts.State,
+		showGates:        opts.Governed && len(opts.Gates) > 0,
 	}
+	m.confirmer = newConfirmer(events)
 	m.restoreMessages(opts.Messages)
 	return m
 }
@@ -470,6 +485,10 @@ func (m *Model) waitForEvent() tea.Cmd {
 // Observer returns an agent.Observer that feeds this model.
 func (m *Model) Observer() agent.Observer { return &observer{events: m.events} }
 
+// Confirmer returns the bridge that pauses ask-level tool calls for a UI
+// decision.
+func (m *Model) Confirmer() agent.Confirmer { return m.confirmer }
+
 // StateReporter returns a function that pushes workflow state changes into
 // the UI. The app calls it whenever the state machine advances.
 func (m *Model) StateReporter() func(workflow.State) {
@@ -552,6 +571,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refresh()
 		return m, m.waitForEvent()
 
+	case confirmationMsg:
+		// Runs are sequential, so a second pending request means the first lost
+		// its owner. Deny it rather than leaving that goroutine blocked forever.
+		if m.confirmation != nil {
+			m.resolveConfirmation(confirmationDeny)
+		}
+		m.confirmation = &msg
+		m.confirmationPane.Open(msg.tool, msg.action, msg.resource)
+		m.resize(m.width, m.height)
+		return m, m.waitForEvent()
+
 	case gateStartMsg:
 		m.showGates = true
 		m.gates.Start(msg.id)
@@ -587,6 +617,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.waitForEvent()
 
 	case doneMsg:
+		if m.confirmation != nil {
+			m.resolveConfirmation(confirmationDeny)
+		}
 		m.busy = false
 		m.activeTool = ""
 		m.cancel = nil
@@ -689,6 +722,45 @@ func (m *Model) toggleToolAt(x, y int) tea.Cmd {
 
 // handleKey processes key input.
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// A permission prompt pauses the model loop and owns every key. Letting a
+	// key reach the textarea or another picker could approve an action while
+	// appearing to do something unrelated.
+	if m.confirmationPane.IsOpen() {
+		switch msg.String() {
+		case "up", "ctrl+p", "k":
+			m.confirmationPane.Move(-1)
+			return m, nil
+		case "down", "ctrl+n", "j":
+			m.confirmationPane.Move(1)
+			return m, nil
+		case "enter":
+			m.resolveConfirmation(m.confirmationPane.Selected())
+			return m, nil
+		case "y":
+			m.resolveConfirmation(confirmationAllowOnce)
+			return m, nil
+		case "a":
+			m.resolveConfirmation(confirmationAllowSession)
+			return m, nil
+		case "n", "esc":
+			m.resolveConfirmation(confirmationDeny)
+			return m, nil
+		case "ctrl+c":
+			m.resolveConfirmation(confirmationDeny)
+			if m.cancel != nil {
+				m.cancel()
+			}
+			return m, nil
+		case "ctrl+d":
+			m.resolveConfirmation(confirmationDeny)
+			if m.cancel != nil {
+				m.cancel()
+			}
+			return m, tea.Quit
+		}
+		return m, nil
+	}
+
 	// While a picker is open it owns navigation and confirmation, so it is
 	// checked before the normal bindings; otherwise "enter" would submit a
 	// prompt instead of selecting a row.
@@ -914,6 +986,9 @@ func (m *Model) command(input string) (bool, tea.Cmd) {
 		}
 	case "/auto":
 		m.Auto = !m.Auto
+		if m.approvals != nil {
+			m.approvals.SetAutoApproval(m.Auto)
+		}
 		m.transcript = append(m.transcript,
 			styleMuted.Render(fmt.Sprintf("  auto-approval %s", onOff(m.Auto))))
 	case "/gates":
@@ -978,8 +1053,9 @@ func (m *Model) resize(width, height int) {
 	m.width, m.height = width, height
 
 	pickerHeight := lipglossHeight(m.picker.View(width))
-	// Reserve rows for the input, the status bar, the gate pane and the picker.
-	chrome := m.input.Height() + 2 + 1 + m.gatePaneHeight(height) + pickerHeight
+	confirmationHeight := lipglossHeight(m.confirmationPane.View(width))
+	// Reserve rows for the input, status bar and whichever modal owns input.
+	chrome := m.input.Height() + 2 + 1 + m.gatePaneHeight(height) + pickerHeight + confirmationHeight
 	viewportHeight := height - chrome
 	if viewportHeight < 3 {
 		viewportHeight = 3
@@ -1136,7 +1212,9 @@ func (m *Model) statusView() string {
 }
 
 func (m *Model) railStatusHeight() int {
-	available := m.height - m.input.Height() - 3 - lipglossHeight(m.picker.View(m.width))
+	available := m.height - m.input.Height() - 3 -
+		lipglossHeight(m.picker.View(m.width)) -
+		lipglossHeight(m.confirmationPane.View(m.width))
 	gateHeight := m.gatePaneHeight(m.height)
 	if available-gateHeight < 4 {
 		return available
@@ -1161,11 +1239,42 @@ func (m *Model) View() string {
 		b.WriteString(pane)
 		b.WriteString("\n")
 	}
+	if pane := m.confirmationPane.View(m.width); pane != "" {
+		b.WriteString(pane)
+		b.WriteString("\n")
+	}
 
 	b.WriteString(m.input.View())
 	b.WriteString("\n")
 	b.WriteString(m.statusBar())
 	return b.String()
+}
+
+func (m *Model) resolveConfirmation(decision confirmationDecision) {
+	if m.confirmation == nil {
+		return
+	}
+	request := m.confirmation
+	m.confirmation = nil
+	m.confirmationPane.Close()
+	select {
+	case request.response <- decision:
+	default:
+	}
+
+	target := request.resource
+	if len([]rune(target)) > 80 {
+		target = truncate(target, 80)
+	}
+	switch decision {
+	case confirmationAllowOnce:
+		m.note(styleOK, fmt.Sprintf("allowed once: %s %s", request.action, target))
+	case confirmationAllowSession:
+		m.note(styleOK, fmt.Sprintf("allowed for session: %s %s", request.action, target))
+	default:
+		m.note(styleWarn, fmt.Sprintf("denied: %s %s", request.action, target))
+	}
+	m.resize(m.width, m.height)
 }
 
 // rightRail stacks independent floating panes at the right edge. The gate

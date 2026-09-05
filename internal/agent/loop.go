@@ -256,30 +256,42 @@ func (l *Loop) Run(ctx context.Context, prompt string) (Result, error) {
 		}
 		l.observer().TurnFinished(usage)
 
-		// Record what the model produced before acting on it, so the
-		// conversation stays coherent even if a tool is refused.
-		assistant := provider.Message{Role: provider.RoleAssistant, Text: text}
-		assistant.ToolCalls = calls
-		l.messages = append(l.messages, assistant)
-
 		if len(calls) == 0 {
 			result.Text = text
 			// A turn that ends without the required handoff is caught here;
 			// the loop owns the turn boundary, so no external hook is needed.
-			if decision := l.Governor.OnTurnEnd(l.task(), l.session(), nil); !decision.Allow {
+			if decision := l.Governor.OnTurnEnd(l.task(), l.session()); !decision.Allow {
 				result.Blocked++
 				l.session().ForcedTool = decision.ForceTool
-				l.messages = append(l.messages, provider.Message{
-					Role:     provider.RoleUser,
-					Text:     decision.Correction,
-					Internal: true,
-				})
+				// An endpoint can finish a streamed response after emitting only
+				// hidden reasoning. There is no assistant artifact to preserve in
+				// that case, and storing an empty message makes every retry larger.
+				if strings.TrimSpace(text) != "" {
+					l.messages = append(l.messages, provider.Message{
+						Role: provider.RoleAssistant,
+						Text: text,
+					})
+				}
+				if decision.AutoPerform != "" {
+					return result, l.missingHandoffError(decision.AutoPerform, text)
+				}
+				l.appendInternalCorrection(decision.Correction)
 				continue
 			}
+			l.messages = append(l.messages, provider.Message{
+				Role: provider.RoleAssistant,
+				Text: text,
+			})
 			return result, nil
 		}
 
-		blocked, names := l.executeCalls(ctx, calls)
+		// Tool calls must be preserved as an assistant message so their
+		// results have a valid parent in the next provider request.
+		assistant := provider.Message{Role: provider.RoleAssistant, Text: text}
+		assistant.ToolCalls = calls
+		l.messages = append(l.messages, assistant)
+
+		blocked := l.executeCalls(ctx, calls)
 		result.Blocked += blocked
 
 		if isStuck, reason := l.stuck(); isStuck {
@@ -289,17 +301,41 @@ func (l *Loop) Run(ctx context.Context, prompt string) (Result, error) {
 				l.failureStreak, reason)
 		}
 
-		if decision := l.Governor.OnTurnEnd(l.task(), l.session(), names); !decision.Allow {
-			result.Blocked++
-			l.session().ForcedTool = decision.ForceTool
-			l.messages = append(l.messages, provider.Message{
-				Role:     provider.RoleUser,
-				Text:     decision.Correction,
-				Internal: true,
-			})
-		}
 	}
 	return result, fmt.Errorf("gave up after %d steps without a final answer", maxSteps)
+}
+
+// appendInternalCorrection keeps a retry instruction next to the newest
+// message without growing the conversation with identical synthetic turns.
+func (l *Loop) appendInternalCorrection(correction string) {
+	if correction == "" {
+		return
+	}
+	if len(l.messages) > 0 {
+		last := l.messages[len(l.messages)-1]
+		if last.Internal && last.Role == provider.RoleUser && last.Text == correction {
+			return
+		}
+	}
+	l.messages = append(l.messages, provider.Message{
+		Role:     provider.RoleUser,
+		Text:     correction,
+		Internal: true,
+	})
+}
+
+// missingHandoffError stops at the policy's auto-escalation rung. Handoffs
+// contain the stage's actual work product, so inventing their arguments would
+// make enforcement appear to succeed while discarding the work it governs.
+func (l *Loop) missingHandoffError(requiredTool, text string) error {
+	response := "the final response contained no tool call"
+	if strings.TrimSpace(text) == "" {
+		response = "the final response contained neither assistant text nor a tool call"
+	}
+	return fmt.Errorf(
+		"model did not call required tool %s after %d workflow violations; %s; "+
+			"verify that the endpoint's served context window fits the prompt and that it honors forced tool_choice",
+		requiredTool, l.session().Violations, response)
 }
 
 // stageBelongsToRuntime handles a stage the model cannot advance.
@@ -435,11 +471,10 @@ func (l *Loop) buildRequest() provider.Request {
 	}
 }
 
-// executeCalls runs the model's requested calls, returning how many were
-// refused and which tool names were attempted.
-func (l *Loop) executeCalls(ctx context.Context, calls []provider.ToolCall) (blocked int, names []string) {
+// executeCalls runs the model's requested calls and returns how many were
+// refused.
+func (l *Loop) executeCalls(ctx context.Context, calls []provider.ToolCall) (blocked int) {
 	for _, call := range calls {
-		names = append(names, call.Name)
 		toolCall := tool.Call{ID: call.ID, Name: call.Name, Args: call.Args}
 
 		// Capture the handoff expected *before* the call runs: a successful
@@ -465,7 +500,7 @@ func (l *Loop) executeCalls(ctx context.Context, calls []provider.ToolCall) (blo
 
 		result, err := l.runTool(ctx, toolCall)
 		if err != nil {
-			return blocked, names
+			return blocked
 		}
 		if call.Name == expectedHandoff && !result.IsError {
 			l.session().HandedOff = true
@@ -474,7 +509,7 @@ func (l *Loop) executeCalls(ctx context.Context, calls []provider.ToolCall) (blo
 		l.appendToolResult(call, result)
 		l.refreshTask()
 	}
-	return blocked, names
+	return blocked
 }
 
 // refreshTask reloads the task and notifies the caller when the stage changed.

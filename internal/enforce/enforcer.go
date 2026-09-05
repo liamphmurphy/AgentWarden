@@ -16,7 +16,8 @@ const (
 	EscalateWarn = "warn"
 	// EscalateForce pins the next call to the required tool via tool_choice.
 	EscalateForce = "force"
-	// EscalateAuto has the runtime perform the required action itself.
+	// EscalateAuto hands the required action to the runtime. The caller may
+	// perform it only when doing so does not require fabricating work product.
 	EscalateAuto = "auto"
 )
 
@@ -36,8 +37,8 @@ type Decision struct {
 	Correction string
 	// ForceTool pins the next turn's tool_choice to this tool.
 	ForceTool string
-	// AutoPerform asks the caller to carry out the required action itself,
-	// the last rung of the ladder.
+	// AutoPerform hands the required action to the caller at the last rung of
+	// the ladder. Semantic handoffs still require model-authored arguments.
 	AutoPerform string
 }
 
@@ -257,10 +258,11 @@ func (e *Enforcer) Intercept(task *workflow.Task, sess *Session, call provider.T
 	return allow()
 }
 
-// OnTurnEnd fires when the model ends a turn. Because the loop owns the turn
-// lifecycle, a role that stops without handing off is detectable here — the
-// gap that had no equivalent hook in the plugin and needed a human to notice.
-func (e *Enforcer) OnTurnEnd(task *workflow.Task, sess *Session, calledTools []string) Decision {
+// OnTurnEnd fires when the model produces a final response with no tool call.
+// Because the loop owns that boundary, a role that stops without handing off
+// is detectable here — the gap that had no equivalent hook in the plugin and
+// needed a human to notice.
+func (e *Enforcer) OnTurnEnd(task *workflow.Task, sess *Session) Decision {
 	// A session that already handed off is finished; the next stage belongs
 	// to a different role's session, so it must not be asked for that stage's
 	// handoff too.
@@ -275,11 +277,6 @@ func (e *Enforcer) OnTurnEnd(task *workflow.Task, sess *Session, calledTools []s
 	handoff := HandoffTool(task.State)
 	if handoff == "" {
 		return allow()
-	}
-	for _, name := range calledTools {
-		if name == handoff {
-			return allow()
-		}
 	}
 	sess.Violations++
 	return e.escalate(task, sess,
